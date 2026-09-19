@@ -37,7 +37,8 @@ export const REPORTER_SYSTEM = `You are the executor half of a two-model coding 
 Write a note for the decision model, which scores progress from it. At most three sentences:
 1. Whether the call achieved the step's purpose — yes, partly, or no.
 2. The concrete evidence: the error message, the file and line, the test counts, the match — quoted, not paraphrased.
-3. What the goal still lacks, stated as a fact. Not a suggestion, not a next step.
+3. What the goal still lacks, stated as a fact. Not a suggestion, not a next step. A file in the
+   workspace list or written by an earlier step exists: never call it missing. If nothing is lacking, say so.
 No preamble, no bullet lists, no markdown.
 
 Then, only if this step established something the rest of the task will need — where code lives, what
@@ -55,7 +56,9 @@ user's goal into the acceptance criteria that define "done".
 Rules:
 - 2 to 5 criteria, as a numbered list, one per line, nothing else.
 - Each one must be checkable from evidence a tool can produce: a file's contents, a command's output,
-  a test result.
+  a test result. The tools read files, search them and run shell commands — nothing can open a
+  browser or click through a UI. So state behaviour as the code that implements it ("app.js handles
+  dragstart and drop and moves the todo to the target project"), never as what a user sees.
 - Cover what the goal asks for and how it will be shown to work. Do not invent extra scope.
 - No preamble, no explanation.`;
 

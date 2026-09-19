@@ -250,7 +250,13 @@ test('maxRecoveries bounds the ladder', async () => {
   );
 
   assert.equal(result.reason, 'needs-input');
-  assert.equal(result.approvals.length, 1, 'one hand-off, then stop');
+  // A recovery now runs the move Jev picks next, so tool approvals appear between the hand-offs.
+  const handoffs = result.approvals.filter((request) => request.tool === 'ask_user');
+  assert.equal(handoffs.length, 1, 'one hand-off, then stop');
+  assert.ok(
+    result.events.some((event) => event.type === 'tool-call' && event.tool !== 'read_file'),
+    'the recovery must try a different move, not climb the ladder without acting',
+  );
 });
 
 test('the answer to a question reaches Jev instead of being discarded', async () => {
@@ -263,9 +269,10 @@ test('the answer to a question reaches Jev instead of being discarded', async ()
   );
 
   assert.equal(result.reason, 'needs-input');
-  assert.ok(result.approvals.length >= 1);
+  const handoffs = result.approvals.filter((request) => request.tool === 'ask_user');
+  assert.ok(handoffs.length >= 1);
   assert.ok(
-    result.approvals.every((request) => typeof request.question === 'string' && request.question.length > 0),
+    handoffs.every((request) => typeof request.question === 'string' && request.question.length > 0),
     'a hand-off approval must carry the question it is asking',
   );
 

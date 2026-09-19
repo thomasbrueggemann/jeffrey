@@ -77,6 +77,11 @@ function displayPath(path: string, ctx: ToolContext): string {
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', 'build', '.next', 'target', '__pycache__', '.venv', 'venv', '.cache']);
 
 async function walk(root: string, maxEntries = 20000): Promise<string[]> {
+  // A file root is searched as itself. It used to read as an empty directory, so grep on
+  // `script.js` reported "(no matches)" for code that was there, and Jev concluded it was missing.
+  const info = await stat(root).catch(() => undefined);
+  if (!info) throw new Error(`${root} does not exist`);
+  if (info.isFile()) return [root];
   const found: string[] = [];
   const queue = [root];
   while (queue.length && found.length < maxEntries) {

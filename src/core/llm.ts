@@ -71,6 +71,7 @@ export class OpenAiCompatibleClient implements LlmClient {
 
   async complete(options: CompleteOptions): Promise<LlmResult> {
     const body: Record<string, unknown> = {
+      ...this.config.extraBody,
       model: this.config.model,
       messages: options.messages,
       stream: true,
