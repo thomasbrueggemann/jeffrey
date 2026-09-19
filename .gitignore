@@ -1,0 +1,35 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Credentials and local configuration — never commit these
+.env
+.env.*
+!.env.example
+jev-agent.config.json
+.jev-agent/
+*.pem
+*.key
+*.p12
+credentials.json
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Test coverage
+coverage/
+
+# Tooling scratch
+.playwright-mcp/
+
+# Operating system and editor cruft
+.DS_Store
+Thumbs.db
+.idea/
+*.swp

@@ -1,0 +1,36 @@
+{
+  "name": "jev-agent",
+  "version": "0.1.0",
+  "description": "A coding agent CLI where Jev (TypeSafe System One) decides what to do next and a configurable LLM does the work.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "jev-agent": "./bin/jev-agent.js"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.tsx",
+    "start": "node bin/jev-agent.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "selftest": "mkdir -p \"${TMPDIR:-/tmp}/jev-agent-selftest\" && tsx src/cli.tsx --jev-mock --llm-mock --print --yes -C \"${TMPDIR:-/tmp}/jev-agent-selftest\" \"selftest: prove the loop routes, executes and re-scores\""
+  },
+  "dependencies": {
+    "ink": "^7.1.1",
+    "ink-text-input": "^6.0.0",
+    "react": "^19.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.1",
+    "@types/react": "^19.3.0",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2"
+  }
+}
