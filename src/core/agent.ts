@@ -7,6 +7,19 @@ import type { LlmClient, LlmMessage } from './llm.js';
 import { Decider, ASK_USER_OPTION, FINISH_OPTION, type DeciderContext, type HistoryEntry } from './decider.js';
 import { ACTION_TOOLS, TOOLS_BY_NAME, type ToolContext, type ToolResult, type ToolSpec } from './tools.js';
 import type { JevClient } from './jev.js';
+import { Ledger, parseCriteria, splitFacts } from './ledger.js';
+import {
+  CRITERIA_SYSTEM,
+  REPORTER_SYSTEM,
+  STEP_INTENTS,
+  buildBrief,
+  callMessage,
+  executorSystem,
+  gatherFiles,
+  schemaKeys,
+  validateArgs,
+  type FileContext,
+} from './executor.js';
 
 export type ToolMode = 'forced' | 'prompt';
 
@@ -32,7 +45,11 @@ export interface RecoveryPlan {
  * answer into a second attempt, not to grind against a model that will not converge.
  */
 const MAX_ROUNDS_PER_STEP = 6;
+/** Below this goal score, a `done` still ends the run but the user is told to check the result. */
+const LOW_FINISH_GOAL_SCORE = 0.3;
 const MAX_TOOL_CORRECTIONS = 2;
+/** Executor calls rejected by `validateArgs` get this many second chances before the step fails. */
+const MAX_ARG_REPAIRS = 2;
 
 /**
  * Approvals are usually a bare choice, but a question's approval carries the user's typed answer
@@ -74,25 +91,6 @@ export interface AgentOptions {
   systemPrompt?: string;
 }
 
-const EXECUTOR_SYSTEM = `You are the executor half of a two-model coding agent.
-
-A separate decision model (Jev) has already chosen which tool to call. That decision is final —
-you do not get to pick a different tool, and you do not get to decide the task is finished.
-Your job is exactly one thing: produce the arguments for the chosen tool call.
-
-Rules:
-- Follow the chosen arguments you are given. They came from the decision model and override anything you would otherwise infer.
-- Every other argument must be concrete, complete, and ready to execute. No placeholders, no "...", no TODO.
-- If you are writing a file, write the real, final content.
-- If you are editing, "old_string" must match the file byte-for-byte, including indentation, and must be unique.
-- Work from the workspace contents and the history. Do not invent file paths.
-- Be terse in any prose. The tool call is the deliverable.`;
-
-const REPORTER_SYSTEM = `You are the executor half of a two-model coding agent.
-A tool has just run. Report what happened in at most two sentences: what changed and what it means
-for the goal. Do not suggest next steps — a separate decision model handles that.
-No preamble, no bullet lists, no markdown headings.`;
-
 export class Agent {
   private readonly budget: Budget = {
     jevCalls: 0,
@@ -104,6 +102,8 @@ export class Agent {
   };
 
   private readonly history: HistoryEntry[] = [];
+  /** The trajectory: criteria, changes, verifications, failures and facts. Outlives the history window. */
+  private readonly ledger = new Ledger();
   private readonly steps: StepRecord[] = [];
   private readonly allowAlways = new Set<string>();
   private notes = '';
@@ -141,13 +141,20 @@ export class Agent {
   private async ask(
     step: number,
   ): Promise<
-    | { ok: true; decision: JevDecision; argChoices: Record<string, string>; argOmitted: Record<string, boolean> }
+    | {
+        ok: true;
+        decision: JevDecision;
+        argChoices: Record<string, string>;
+        argOmitted: Record<string, boolean>;
+        intent?: string;
+      }
     | { ok: false; message: string }
   > {
     try {
       const result = await this.decider.decide(await this.buildContext(step));
       this.budget.jevCalls += 2;
       this.options.onEvent({ type: 'decision', step, decision: result.decision });
+      this.applyCriteria(step, result.decision);
       this.options.onEvent({ type: 'budget', budget: { ...this.budget } });
       return { ok: true, ...result };
     } catch (error) {
@@ -175,7 +182,12 @@ export class Agent {
       workspace: config.agent.workspace,
       allowOutsideWorkspace: config.agent.allowOutsideWorkspace,
       bashTimeoutMs: config.agent.bashTimeoutMs,
+      ...(signal ? { signal } : {}),
     };
+
+    onEvent({ type: 'phase', phase: 'planning' });
+    this.ledger.setCriteria(await this.planCriteria());
+    this.emitCriteria(0, []);
 
     for (let step = 1; step <= config.agent.maxSteps; step++) {
       if (signal?.aborted) {
@@ -193,6 +205,7 @@ export class Agent {
       let decision = first.decision;
       let argChoices = first.argChoices;
       let argOmitted = first.argOmitted;
+      let intent = first.intent;
 
       /** Re-ask within the same step, so a recovery costs Jev calls but not steps. */
       const reask = async (): Promise<{ reason: string; summary: string } | null> => {
@@ -204,6 +217,7 @@ export class Agent {
         decision = next.decision;
         argChoices = next.argChoices;
         argOmitted = next.argOmitted;
+        intent = next.intent;
         return null;
       };
 
@@ -228,6 +242,13 @@ export class Agent {
         }
 
         if (decision.route === 'jev-finish') {
+          if (decision.goalReached < LOW_FINISH_GOAL_SCORE) {
+            onEvent({
+              type: 'notice',
+              level: 'warn',
+              message: `Jev chose "done" with a low goal score (p=${decision.goalReached.toFixed(2)}) — check the result yourself.`,
+            });
+          }
           return {
             reason: 'finished',
             summary: `Jev selected "done" (p=${decision.goalReached.toFixed(2)}).`,
@@ -314,6 +335,9 @@ export class Agent {
         // is real, then re-ask with the correction — a closed-set answer is not an error, and a
         // free-form hallucination deserves one chance to be corrected before the run ends.
         const substitute = TOOLS_BY_NAME.get(decision.fallbackTool);
+        if (substitute?.name === FINISH_OPTION) {
+          return { reason: 'finished', summary: `Jev's runner-up was "done" after naming the unknown tool "${decision.tool}".`, decision };
+        }
         if (substitute) {
           onEvent({
             type: 'notice',
@@ -350,13 +374,26 @@ export class Agent {
       }
       tool = chosen;
       const toolName = chosen.name;
-      // The diagnosis did its job; a fresh one is built if the loop reports stuck again.
+      // The diagnosis did its job for Jev; the executor still gets it once, because a user's answer
+      // or a "produce the deliverable" instruction is as much about the arguments as the tool.
+      // A fresh one is built if the loop reports stuck again.
+      const steering = this.steering;
       this.steering = [];
 
       onEvent({ type: 'phase', phase: 'planning' });
       let args: Record<string, unknown>;
       try {
-        args = await this.planArguments(tool, decision, argChoices, argOmitted);
+        const planned = await this.planArguments(tool, decision, { argChoices, argOmitted, intent, steering });
+        args = planned.args;
+        if (planned.problems.length) {
+          // A call that is known to fail is not run: Jev gets the precise reason instead of a
+          // garbled tool error, and a write_file full of "..." never reaches the disk.
+          const observation = `executor could not produce a valid ${toolName} call:\n${planned.problems.map((p) => `- ${p}`).join('\n')}`;
+          this.record(step, toolName, args, false, observation, decision.progress);
+          onEvent({ type: 'observation', step, tool: toolName, ok: false, output: observation, summary: 'rejected before running' });
+          this.notes = `${toolName} was not run: ${planned.problems[0]}`;
+          continue;
+        }
       } catch (error) {
         const message = (error as Error).message;
         onEvent({ type: 'notice', level: 'error', message: `Executor failed: ${message}` });
@@ -438,7 +475,10 @@ export class Agent {
       // --- narration ------------------------------------------------------------------------
       if (this.options.narrate !== false) {
         onEvent({ type: 'phase', phase: 'verifying' });
-        this.notes = await this.narrate(tool, args, observation, result.ok);
+        const { note, facts } = splitFacts(await this.narrate(tool, args, observation, result, intent));
+        this.notes = note || `${tool.name} → ${result.summary}`;
+        const path = typeof args['path'] === 'string' ? [args['path']] : [];
+        this.ledger.addFacts(step, facts, path);
       } else {
         this.notes = `${tool.name} → ${result.summary}`;
       }
@@ -582,6 +622,9 @@ export class Agent {
       dynamicOptions: await this.dynamicOptions(goal),
       steering: this.steering,
       excludeTools: [...this.excludedTools],
+      criteria: this.ledger.criteria.map(({ id, text }) => ({ id, text })),
+      criterionMetThreshold: config.agent.criterionMetThreshold,
+      ledger: this.ledger.view(step),
     };
   }
 
@@ -616,71 +659,107 @@ export class Agent {
   /**
    * Ask the executor for the tool arguments. Jev's closed-set answers are injected as settled
    * facts and re-applied after parsing, so the executor cannot silently override the router.
+   *
+   * The brief carries what the call needs to be right the first time — the purpose Jev gave the
+   * step, the target file's current contents, the last results in full — and a call that would
+   * fail anyway is sent back with the concrete problem instead of being run.
    */
   private async planArguments(
     tool: ToolSpec,
     decision: JevDecision,
-    argChoices: Record<string, string>,
-    argOmitted: Record<string, boolean>,
-  ): Promise<Record<string, unknown>> {
-    const { config, llm, goal } = this.options;
+    jev: {
+      argChoices: Record<string, string>;
+      argOmitted: Record<string, boolean>;
+      intent: string | undefined;
+      steering: string[];
+    },
+  ): Promise<{ args: Record<string, unknown>; problems: string[] }> {
+    const { config, goal } = this.options;
+    const { workspace } = config.agent;
     const settled: Record<string, string> = {};
     const omitted: string[] = [];
-    for (const [key, value] of Object.entries(argChoices)) {
+    for (const [key, value] of Object.entries(jev.argChoices)) {
       if (key.startsWith(`${tool.name}.`)) settled[key.slice(tool.name.length + 1)] = value;
     }
-    for (const [key, isOmitted] of Object.entries(argOmitted)) {
+    for (const [key, isOmitted] of Object.entries(jev.argOmitted)) {
       if (isOmitted && key.startsWith(`${tool.name}.`)) omitted.push(key.slice(tool.name.length + 1));
     }
 
-    const guidance = [
-      settledKeys(settled).length
-        ? `The decision model has already settled these arguments — use them exactly:\n${settledKeys(settled)
-            .map((key) => `  ${key} = ${JSON.stringify(settled[key])}`)
-            .join('\n')}`
-        : 'The decision model settled no arguments; you must supply all of them.',
-      omitted.length
-        ? `Omit these optional arguments entirely so the tool default applies: ${omitted.join(', ')}`
-        : '',
-    ]
-      .filter(Boolean)
-      .join('\n\n');
+    const budget = config.llm.contextChars;
+    const candidates = rankFiles(this.fileCache, goal).slice(0, 8);
+    const scripts = tool.commandArgs?.length ? await detectScripts(workspace) : [];
+    const stage = decision.progressLegend[String(Math.round(decision.progress))];
+    const gather = (paths: Record<string, string>) =>
+      gatherFiles({ tool, settled: paths, history: this.history, candidates, workspace, budget: Math.floor(budget * 0.6) });
 
-    const messages: LlmMessage[] = [
-      { role: 'system', content: this.executorSystem(tool) },
-      { role: 'user', content: this.executorBrief(goal) },
-      {
-        role: 'user',
-        content: [
-          `Call this tool now: ${tool.name}`,
-          '',
-          guidance,
-          '',
-          'Produce the tool call.',
-        ].join('\n'),
-      },
-    ];
+    let files = gather(settled);
+    this.announceContext(files, jev.intent);
 
     const forced = (this.options.toolMode ?? 'forced') === 'forced';
-    let parsed: Record<string, unknown> | undefined;
+    let args: Record<string, unknown> = {};
+    let problems: string[] = [];
 
-    if (forced) {
-      const result = await this.llmCall(messages, tool, 'forced');
-      if (result) parsed = result;
-    }
-    if (!parsed) {
-      const result = await this.llmCall(messages, tool, 'prompt');
-      parsed = result ?? {};
-    }
+    for (let attempt = 0; attempt <= MAX_ARG_REPAIRS; attempt++) {
+      const messages: LlmMessage[] = [
+        { role: 'system', content: executorSystem(tool, this.options.systemPrompt) },
+        {
+          role: 'user',
+          content: buildBrief({
+            goal,
+            workspace,
+            ...(jev.intent ? { intent: jev.intent } : {}),
+            ...(stage ? { stage } : {}),
+            steering: jev.steering,
+            notes: this.notes,
+            history: this.history,
+            candidates,
+            scripts,
+            files,
+            observationChars: Math.floor(budget * 0.15),
+            ledger: this.ledger.view(this.budget.steps, Math.floor(budget * 0.1)),
+          }),
+        },
+        { role: 'user', content: callMessage(tool, settled, omitted, problems) },
+      ];
 
-    const merged: Record<string, unknown> = { ...parsed };
-    for (const [key, value] of Object.entries(settled)) {
-      merged[key] = coerce(value, tool, key);
+      let parsed: Record<string, unknown> | undefined;
+      if (forced) parsed = await this.llmCall(messages, tool, 'forced');
+      if (!parsed) parsed = await this.llmCall(messages, tool, 'prompt');
+
+      args = schemaKeys(tool, parsed ?? {});
+      for (const [key, value] of Object.entries(settled)) {
+        args[key] = coerce(value, tool, key);
+      }
+      for (const key of omitted) {
+        if (args[key] === undefined || args[key] === null) delete args[key];
+      }
+
+      problems = parsed ? validateArgs(tool, args, workspace) : ['The reply contained no tool call and no JSON arguments.'];
+      if (!problems.length) break;
+      if (attempt === MAX_ARG_REPAIRS) break;
+
+      this.options.onEvent({
+        type: 'notice',
+        level: 'info',
+        message: `Executor's ${tool.name} call rejected, asking again: ${problems[0]}`,
+      });
+      // The executor may have named a file nobody showed it. Show it before the retry.
+      const named = typeof args['path'] === 'string' ? args['path'] : undefined;
+      if (named && !files.some((file) => file.path === named)) {
+        files = gather({ ...settled, path: named });
+        this.announceContext(files, jev.intent);
+      }
     }
-    for (const key of omitted) {
-      if (merged[key] === undefined || merged[key] === null) delete merged[key];
-    }
-    return merged;
+    return { args, problems };
+  }
+
+  private announceContext(files: FileContext[], intent: string | undefined): void {
+    if (!files.length) return;
+    this.options.onEvent({
+      type: 'llm-context',
+      paths: files.map((file) => (file.exists ? file.path : `${file.path} (new)`)),
+      why: intent ? (STEP_INTENTS[intent] ?? intent) : '',
+    });
   }
 
   private async llmCall(
@@ -741,17 +820,27 @@ export class Agent {
     return undefined;
   }
 
-  private async narrate(tool: ToolSpec, args: Record<string, unknown>, observation: string, ok: boolean): Promise<string> {
+  private async narrate(
+    tool: ToolSpec,
+    args: Record<string, unknown>,
+    observation: string,
+    result: ToolResult,
+    intent: string | undefined,
+  ): Promise<string> {
+    const ok = result.ok;
     const messages: LlmMessage[] = [
       { role: 'system', content: REPORTER_SYSTEM },
       {
         role: 'user',
         content: [
           `Goal: ${this.options.goal}`,
+          ...(intent ? [`Purpose of this step: ${STEP_INTENTS[intent] ?? intent}`] : []),
           `Tool: ${tool.name}(${summariseArgs(args)})`,
           `Result: ${ok ? 'success' : 'failure'}`,
           '',
           observation,
+          // An edit's output is "replaced 1 occurrence(s)"; the diff is the actual evidence.
+          ...(result.diff ? ['', 'Diff:', clamp(result.diff, 3000)] : []),
         ].join('\n'),
       },
     ];
@@ -774,29 +863,6 @@ export class Agent {
     } catch {
       return `${tool.name} ${ok ? 'succeeded' : 'failed'}: ${observation.slice(0, 200)}`;
     }
-  }
-
-  private executorSystem(tool: ToolSpec): string {
-    const base = this.options.systemPrompt ? `${EXECUTOR_SYSTEM}\n\n${this.options.systemPrompt}` : EXECUTOR_SYSTEM;
-    return `${base}\n\nTool schema:\n${JSON.stringify(tool.parameters, null, 2)}`;
-  }
-
-  private executorBrief(goal: string): string {
-    const { config } = this.options;
-    const history = this.history.slice(-8);
-    const lines = [
-      `Goal: ${goal}`,
-      `Workspace: ${config.agent.workspace}`,
-      '',
-      history.length ? 'History so far:' : 'No steps have run yet.',
-    ];
-    for (const entry of history) {
-      lines.push(
-        `  step ${entry.step}: ${entry.tool}(${summariseArgs(entry.args)}) → ${entry.ok ? 'ok' : 'failed'} — ${firstLine(entry.observation)}`,
-      );
-    }
-    if (this.notes) lines.push('', `Your own note from last step: ${this.notes}`);
-    return lines.join('\n');
   }
 
   private async preview(tool: ToolSpec, args: Record<string, unknown>, ctx: ToolContext): Promise<string | undefined> {
@@ -830,15 +896,68 @@ export class Agent {
     observation: string,
     progress: number,
   ): void {
-    this.history.push({ step, tool, args, ok, observation, progress });
+    const entry = { step, tool, args, ok, observation, progress };
+    this.history.push(entry);
+    this.ledger.observe(entry);
+  }
+
+  /**
+   * Turn the goal into acceptance criteria, once, before the first step. This is what gives Jev a
+   * trajectory to score against. It never fails the run: without a usable list the goal itself is
+   * the single criterion, which is exactly the behaviour from before criteria existed.
+   */
+  private async planCriteria(): Promise<string[]> {
+    const { goal } = this.options;
+    try {
+      const result = await this.options.llm.complete({
+        messages: [
+          { role: 'system', content: CRITERIA_SYSTEM },
+          { role: 'user', content: `Goal: ${goal}\nWorkspace: ${this.options.config.agent.workspace}` },
+        ],
+        ...(this.options.signal ? { signal: this.options.signal } : {}),
+      });
+      this.budget.llmCalls += 1;
+      this.budget.llmPromptTokens += result.usage.promptTokens;
+      this.budget.llmCompletionTokens += result.usage.completionTokens;
+      const criteria = parseCriteria(result.content);
+      if (criteria.length) return criteria;
+    } catch (error) {
+      this.options.onEvent({
+        type: 'notice',
+        level: 'info',
+        message: `Could not plan acceptance criteria (${(error as Error).message}); scoring against the goal alone.`,
+      });
+    }
+    return [goal];
+  }
+
+  private applyCriteria(step: number, decision: JevDecision): void {
+    if (!decision.criteria) return;
+    const answers: Record<number, number> = {};
+    for (const [id, p] of Object.entries(decision.criteria)) answers[Number(id)] = p;
+    const changed = this.ledger.applyCriteria(answers, step, this.options.config.agent.criterionMetThreshold);
+    if (changed.length) this.emitCriteria(step, changed);
+    if (decision.criteriaVeto) {
+      const open = this.ledger.firstOpen();
+      this.options.onEvent({
+        type: 'notice',
+        level: 'info',
+        message: `Jev scored the goal as reached, but ${open ? `criterion ${open.id} (${open.text})` : 'a criterion'} is still open — continuing.`,
+      });
+    }
+  }
+
+  private emitCriteria(step: number, changed: number[]): void {
+    this.options.onEvent({
+      type: 'criteria',
+      step,
+      criteria: this.ledger.criteria.map(({ id, text, met }) => ({ id, text, met })),
+      changed,
+    });
   }
 }
 
 /* ------------------------------------------------------------------ helpers */
-
-function settledKeys(settled: Record<string, string>): string[] {
-  return Object.keys(settled);
-}
 
 /** Closed-set values are strings by construction; convert when the schema wants another type. */
 function coerce(value: string, tool: ToolSpec, arg: string): unknown {
@@ -884,11 +1003,6 @@ function summariseArgs(args: Record<string, unknown>): string {
       )
       .join(', ') || ''
   );
-}
-
-function firstLine(text: string): string {
-  const line = text.split('\n').find((entry) => entry.trim()) ?? '';
-  return line.length > 160 ? `${line.slice(0, 160)}…` : line;
 }
 
 function clamp(text: string, max: number): string {

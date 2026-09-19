@@ -298,3 +298,49 @@ test('declining a question still stops cleanly', async () => {
   assert.equal(result.reason, 'aborted');
   assert.equal(result.approvals.length, 1);
 });
+
+test('an open acceptance criterion vetoes goal-reached', async () => {
+  // Jev scores the goal as reached and progress as complete, but says a criterion is unmet. The
+  // goal-reached route must not fire; choosing `done` stays authoritative, so the run finishes that way.
+  const result = await run({ tools: ['read_file'], criteriaMet: 0.1 });
+
+  assert.equal(result.reason, 'finished', `expected the veto to hold: ${result.summary}`);
+  const vetoed = decisions(result).find((event) => event.decision.criteriaVeto);
+  assert.ok(vetoed, 'expected a decision flagged as vetoed by the criteria');
+  assert.notEqual(vetoed.decision.route, 'goal-reached');
+  assert.ok(notices(result, 'info').some((message) => /criterion 1 .* is still open/.test(message)));
+});
+
+test('Jev scores against the criteria and sees the ledger', async () => {
+  const result = await run({ tools: ['read_file', 'run_shell'] }, 'fix the off-by-one in src/index.ts', 'allow', {
+    autoApprove: true,
+  });
+  assert.equal(result.reason, 'goal-reached', result.summary);
+
+  const criteria = result.events.filter((event) => event.type === 'criteria');
+  assert.ok(criteria.length >= 2, 'expected the planned criteria and at least one change');
+  assert.equal(criteria[0]!.type === 'criteria' && criteria[0].criteria.length, 2, 'the mock executor plans two');
+
+  const routing = result.states.filter((state) => 'tools_available' in state);
+  const ledger = routing[0]!.ledger as Record<string, unknown>;
+  assert.match(String(ledger.focus), /^criterion 1: /);
+
+  // After run_shell, the command and its result are in the ledger Jev scores from.
+  const last = routing.at(-1)!.ledger as { verification?: Array<{ command: string }> };
+  assert.equal(last.verification?.[0]?.command, 'echo mock-executor-ran');
+});
+
+test('choosing done ends the run even when the goal score is low', async () => {
+  // The live failure: Jev picked `done` while its separate goal-reached score sat at 0.16–0.23.
+  // Routed as a low-confidence action, `done` ran as a no-op tool and the loop kept going.
+  const result = await run({ tools: ['read_file', 'done', 'read_file', 'read_file'], goalReached: 0.1 });
+
+  assert.equal(result.reason, 'finished', `expected done to end the run: ${result.summary}`);
+  assert.ok(
+    !result.events.some((event) => event.type === 'tool-call' && event.tool === 'done'),
+    'done is a verdict, never an executed tool',
+  );
+  const done = result.events.find((event): event is DoneEvent => event.type === 'done');
+  assert.equal(done?.steps, 2, 'the run should stop on the step Jev chose done');
+  assert.ok(notices(result, 'warn').some((message) => /goal score/.test(message)));
+});

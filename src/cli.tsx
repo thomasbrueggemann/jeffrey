@@ -96,6 +96,11 @@ const HELP = `
     --print                  Headless transcript on stdout, no TUI
     --json                   One JSON object per event (implies --print)
 
+  In the TUI
+    /exit                    Leave the session (also /quit, /q)
+    ctrl-c                   Leave, or abort the running step
+    esc                      Abort the running step
+
   Setup
     --init                   Write a starter config to ~/.jeffrey/config.json
     --show-config            Print the effective config with secrets redacted
@@ -469,6 +474,16 @@ export function createPrinter(write = plain): {
       case 'budget':
         budget = event.budget;
         break;
+      case 'criteria': {
+        const met = event.criteria.filter((criterion) => criterion.met).length;
+        write(`   ${event.step === 0 ? 'done means' : 'criteria'}: ${met}/${event.criteria.length} met`);
+        for (const criterion of event.criteria) {
+          if (event.step === 0 || event.changed.includes(criterion.id)) {
+            write(`     [${criterion.met ? 'x' : ' '}] ${criterion.id}. ${criterion.text}`);
+          }
+        }
+        break;
+      }
       case 'done':
         reason = event.reason;
         summary = event.summary;

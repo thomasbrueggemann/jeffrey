@@ -1,6 +1,8 @@
 import type { SystemOneResponse, JevDecision, DecisionRoute, Question } from '../types.js';
 import { asChoice, asNoul, asScore, choice, noul, score, type JevClient } from './jev.js';
 import type { ToolSpec } from './tools.js';
+import { STEP_INTENTS } from './executor.js';
+import type { LedgerView } from './ledger.js';
 
 export interface HistoryEntry {
   step: number;
@@ -46,6 +48,16 @@ export interface DeciderContext {
    * route; asking politely in the state does not survive a confident model.
    */
   excludeTools?: string[];
+  /**
+   * Acceptance criteria written at the start of the run. Each gets its own yes/no question, and a
+   * goal-reached verdict needs every one of them met: "is the goal reached?" asked once is easy to
+   * answer optimistically, a checklist is not.
+   */
+  criteria?: Array<{ id: number; text: string }>;
+  /** Probability at or above which a criterion counts as met. */
+  criterionMetThreshold?: number;
+  /** The trajectory so far, beyond the history window. */
+  ledger?: LedgerView;
 }
 
 export interface DeciderResult {
@@ -54,6 +66,11 @@ export interface DeciderResult {
   argChoices: Record<string, string>;
   /** Arguments Jev judged unstated, so the executor should leave them out. */
   argOmitted: Record<string, boolean>;
+  /**
+   * What the chosen call is for — one of `STEP_INTENTS`. The tool alone underdetermines the call:
+   * `read_file` to locate code and `read_file` to check an edit want different arguments.
+   */
+  intent?: string;
   /** Tools that survived the relevance screen and got full argument questions. */
   shortlist: string[];
 }
@@ -158,6 +175,15 @@ export class Decider {
         false: 'the agent can proceed from the workspace and the history alone',
       },
     );
+    for (const criterion of ctx.criteria ?? []) {
+      questions[`criterion.${criterion.id}`] = noul(
+        `Is this acceptance criterion satisfied right now, based only on evidence in the history and the ledger? Criterion: ${criterion.text}`,
+        {
+          true: 'a tool result in the history or ledger shows this criterion holds',
+          false: 'there is no evidence yet, or the evidence shows it does not hold',
+        },
+      );
+    }
     questions['risk'] = score(
       'How risky or hard to reverse is the action you selected as next_action?',
       RISK_LEVELS,
@@ -169,9 +195,15 @@ export class Decider {
     const shortlist = overBudget ? this.screen(tools, response, ctx.maxRelevantTools) : candidates;
 
     // 4. Argument questions for the shortlisted tools only.
-    const { argChoices, argOmitted } = await this.askArguments(ctx, shortlist, state, response);
+    const { argChoices, argOmitted, intent } = await this.askArguments(ctx, shortlist, state, response);
 
-    return { decision: this.interpret(ctx, response, shortlist), argChoices, argOmitted, shortlist };
+    return {
+      decision: this.interpret(ctx, response, shortlist),
+      argChoices,
+      argOmitted,
+      ...(intent ? { intent } : {}),
+      shortlist,
+    };
   }
 
   /** Keep the tools Jev considered plausible, always leaving room for at least two. */
@@ -192,10 +224,17 @@ export class Decider {
     shortlist: string[],
     state: unknown,
     routing: SystemOneResponse,
-  ): Promise<{ argChoices: Record<string, string>; argOmitted: Record<string, boolean> }> {
+  ): Promise<{ argChoices: Record<string, string>; argOmitted: Record<string, boolean>; intent?: string }> {
     const argChoices: Record<string, string> = {};
     const argOmitted: Record<string, boolean> = {};
     const questions: Record<string, Question> = {};
+
+    // Asked alongside the arguments because it depends on the routing answer, and it is what the
+    // executor needs most: the tool says what to call, the intent says what the call has to achieve.
+    questions['step_intent'] = choice(
+      'What is the action already chosen in decision_already_made meant to achieve at this point?',
+      STEP_INTENTS,
+    );
 
     for (const name of shortlist) {
       const tool = ctx.tools.find((entry) => entry.name === name);
@@ -229,8 +268,6 @@ export class Decider {
       }
     }
 
-    if (!Object.keys(questions).length) return { argChoices, argOmitted };
-
     // The routing answer is echoed into the state so the argument questions are asked in the
     // context of the decision that was just made, not in a vacuum.
     const enrichedState = {
@@ -250,7 +287,9 @@ export class Decider {
       return { argChoices, argOmitted };
     }
 
+    const intent = asChoice(response.answers['step_intent'])?.choice;
     for (const id of Object.keys(questions)) {
+      if (id === 'step_intent') continue;
       if (id.endsWith('?')) {
         argOmitted[id.slice(0, -1)] = (asNoul(response.answers[id])?.noul ?? 1) < 0.5;
       } else {
@@ -259,7 +298,7 @@ export class Decider {
         if (picked && picked !== EXECUTOR_DECIDES) argChoices[id] = picked;
       }
     }
-    return { argChoices, argOmitted };
+    return { argChoices, argOmitted, ...(intent && intent in STEP_INTENTS ? { intent } : {}) };
   }
 
   private interpret(ctx: DeciderContext, response: SystemOneResponse, shortlist: string[]): JevDecision {
@@ -278,6 +317,13 @@ export class Decider {
     const stuckP = stuck?.noul ?? 0;
     const needsUserP = needsUser?.noul ?? 0;
 
+    const criteria: Record<string, number> = {};
+    for (const criterion of ctx.criteria ?? []) {
+      criteria[String(criterion.id)] = asNoul(response.answers[`criterion.${criterion.id}`])?.noul ?? 0;
+    }
+    const threshold = ctx.criterionMetThreshold ?? 0.6;
+    const criteriaMet = Object.values(criteria).every((p) => p >= threshold);
+
     const route = routeFor({
       ctx,
       tool,
@@ -287,6 +333,7 @@ export class Decider {
       stuckP,
       needsUserP,
       shortlist,
+      criteriaMet,
     });
 
     const toolRelevance: Record<string, number> = {};
@@ -309,6 +356,10 @@ export class Decider {
       fallbackTool: fallback?.choice ?? '',
       toolRelevance,
       route,
+      ...(ctx.criteria?.length ? { criteria } : {}),
+      ...(!criteriaMet && goalReached >= ctx.goalReachedThreshold && progressScore >= ctx.minProgressScore
+        ? { criteriaVeto: true }
+        : {}),
       raw: response,
     };
   }
@@ -323,6 +374,8 @@ interface RouteInput {
   stuckP: number;
   needsUserP: number;
   shortlist: string[];
+  /** Every acceptance criterion met, or none were set. */
+  criteriaMet: boolean;
 }
 
 /**
@@ -336,17 +389,20 @@ interface RouteInput {
  *
  * A goal-reached verdict needs both a high probability and a matching progress score — the two
  * questions are asked independently, so requiring them to agree filters out a single-question
- * false positive. Note this deliberately outranks `done`: a model that selects the finish option
+ * false positive — and the acceptance criteria have to agree as well. Note this deliberately outranks `done`: a model that selects the finish option
  * while both signals agree it is finished has agreed with itself.
  */
 function routeFor(input: RouteInput): DecisionRoute {
-  const { ctx, tool, confidence, goalReached, progressScore, stuckP, shortlist } = input;
+  const { ctx, tool, confidence, goalReached, progressScore, stuckP, shortlist, criteriaMet } = input;
 
-  if (goalReached >= ctx.goalReachedThreshold && progressScore >= ctx.minProgressScore) {
+  // Only this route is gated on the criteria. Jev choosing `done` stays authoritative, as above:
+  // vetoing that too would leave a model that insists it is finished running to the step limit.
+  if (goalReached >= ctx.goalReachedThreshold && progressScore >= ctx.minProgressScore && criteriaMet) {
     return 'goal-reached';
   }
   if (tool === FINISH_OPTION) {
-    return goalReached >= 0.3 ? 'jev-finish' : 'act-low-confidence';
+    // Never an action: routed anywhere else, `done` runs as a no-op tool and the loop carries on.
+    return 'jev-finish';
   }
   if (tool === ASK_USER_OPTION) {
     return 'ask-user';
@@ -401,6 +457,9 @@ export function buildState(ctx: DeciderContext): unknown {
       progress_after: entry.progress.toFixed(1),
     })),
     agent_notes: ctx.notes ? truncate(ctx.notes, 2000) : undefined,
+    // The trajectory: acceptance criteria and which one is open, what changed, what was verified
+    // since, what already failed, what was learned. It outlives the history window above.
+    ledger: ctx.ledger && Object.keys(ctx.ledger).length ? ctx.ledger : undefined,
     // Loop diagnosis, when the agent has escalated. Facts, not advice — this is input to the next
     // decision, not a narration of the last one.
     steering: ctx.steering?.length ? ctx.steering : undefined,

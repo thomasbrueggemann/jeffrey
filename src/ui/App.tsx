@@ -4,6 +4,7 @@ import TextInput from 'ink-text-input';
 import type { AgentEvent, ApprovalRequest, ApprovalResponse } from '../types.js';
 import { Header, ApprovalBox, StatusBar, StepBlock, renderBlock } from './components.js';
 import { initialState, reduce, type StepView } from './view.js';
+import { isExitCommand } from './slash.js';
 import { glyph, spinnerFrame, theme } from './theme.js';
 
 export interface RunnerOptions {
@@ -77,6 +78,9 @@ export function App(props: AppProps) {
     (request: ApprovalRequest) =>
       new Promise<ApprovalResponse>((resolve) => {
         approvalResolver.current = resolve;
+        // The agent's last phase is whatever preceded the request ("planning" for a tool approval),
+        // so without this the transcript and status read as though the executor were still busy.
+        dispatch({ type: 'phase', phase: 'approving' });
         setApproval(request);
       }),
     [],
@@ -144,6 +148,15 @@ export function App(props: AppProps) {
 
   useInput(
     (char, key) => {
+      if (key.ctrl && char === 'c') {
+        // Claimed first and unconditionally: this handler used to be inactive at the idle prompt, so
+        // ctrl-c there fell through to `TextInput`, which ignores it — a silent no-op. Ink's own
+        // exit-on-ctrl-c is off (`exitOnCtrlC: false`), so quitting is entirely our job. `quit()`
+        // aborts a run (and its child process) on the way out, so ctrl-c always means "leave" and
+        // `esc` remains the way to stop a run without leaving.
+        quit();
+        return;
+      }
       if (asking) {
         // A question is answered with the prompt's text input, not with y/n — so no keys are claimed
         // here and typed characters reach the input. Only the escape hatch is handled.
@@ -156,18 +169,9 @@ export function App(props: AppProps) {
         else if (char === 'n' || char === 'N' || key.escape) resolveApproval('deny');
         return;
       }
-      if (key.ctrl && char === 'c') {
-        if (running) {
-          dispatch({ type: 'notice', level: 'warn', message: 'aborting — sending SIGINT to the running tool' });
-          abort();
-        } else {
-          quit();
-        }
-        return;
-      }
       if (running && key.escape) abort();
     },
-    { isActive: approval !== null || running },
+    { isActive: true },
   );
 
   const live = state.live;
@@ -175,7 +179,7 @@ export function App(props: AppProps) {
     if (asking) return 'type your answer · enter send · esc decline';
     if (approval) return 'y allow · a always · n deny';
     if (running) return 'esc abort · ctrl-c quit';
-    return 'enter run · ctrl-c quit';
+    return 'enter run · /exit quit · ctrl-c quit';
   }, [approval, asking, running]);
 
   return (
@@ -205,7 +209,9 @@ export function App(props: AppProps) {
 
       {approval ? <ApprovalBox request={approval} /> : null}
 
-      {approval ? (
+      {asking ? (
+        // Only a question gets a text input. A y/n approval is answered with a single key, and an
+        // input there both reads as "type something" and swallows the key into the next prompt.
         <Box marginTop={1} flexDirection="column">
           <Box borderStyle="round" borderColor={theme.warn} paddingX={1} width="100%">
             <Text color={theme.warn}>{glyph.prompt} </Text>
@@ -213,15 +219,11 @@ export function App(props: AppProps) {
               value={input}
               onChange={setInput}
               onSubmit={(value) => {
-                if (asking) {
-                  const answer = value.trim();
-                  // Enter on an empty answer means "no answer" — treat it as declining rather than
-                  // handing Jev a blank instruction it cannot act on.
-                  if (answer) resolveApproval({ choice: 'allow', answer });
-                  else resolveApproval('deny');
-                  return;
-                }
-                resolveApproval('allow');
+                const answer = value.trim();
+                // Enter on an empty answer means "no answer" — treat it as declining rather than
+                // handing Jev a blank instruction it cannot act on.
+                if (answer) resolveApproval({ choice: 'allow', answer });
+                else resolveApproval('deny');
               }}
               placeholder="answer the agent…"
               focus
@@ -231,9 +233,15 @@ export function App(props: AppProps) {
             <Text color={theme.dim}>{hint}</Text>
           </Box>
         </Box>
+      ) : approval ? (
+        <Box paddingX={1} marginTop={1}>
+          <Text color={theme.warn}>{hint}</Text>
+        </Box>
       ) : null}
 
-      {running && !asking ? (
+      {running && !approval ? (
+        // Hidden while waiting on the user: a spinning "executor filling in arguments" and a
+        // climbing elapsed counter make a paused run look like a hung one.
         <Box marginTop={1} flexDirection="column">
           <StatusBar
             phase={PHASE_LABEL[state.phase] ?? state.phase}
@@ -252,12 +260,6 @@ export function App(props: AppProps) {
         </Box>
       ) : null}
 
-      {approval && !asking ? (
-        <Box paddingX={1} marginTop={1}>
-          <Text color={theme.dim}>{hint}</Text>
-        </Box>
-      ) : null}
-
       {!running && !approval ? (
         <Box marginTop={1} flexDirection="column">
           <Box borderStyle="round" borderColor={theme.accent} paddingX={1} width="100%">
@@ -267,7 +269,10 @@ export function App(props: AppProps) {
               onChange={setInput}
               onSubmit={(value) => {
                 setInput('');
-                void run(value);
+                // `/exit` (and friends) leave the session; anything else is a goal. An unknown
+                // slash command is still a goal — the agent may well have a reason to see it.
+                if (isExitCommand(value)) quit();
+                else void run(value);
               }}
               placeholder={
                 goalsRef.current.length === 0

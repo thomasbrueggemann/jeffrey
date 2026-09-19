@@ -39,6 +39,11 @@ export interface MockScript {
   hallucinations?: Record<number, string>;
   /** Extend the hallucination to `fallback_action`, leaving the agent no real runner-up to use. */
   hallucinateFallback?: boolean;
+  /**
+   * Probability reported for every acceptance criterion. Defaults to tracking `goal_reached`, so a
+   * script that ends in a finished goal also ends with every criterion met.
+   */
+  criteriaMet?: number;
 }
 
 export class MockJevClient implements JevClient {
@@ -104,6 +109,9 @@ export class MockJevClient implements JevClient {
       return 0.05;
     }
     if (id === 'needs_user') return this.script.needsUser ?? 0.03;
+    if (id.startsWith('criterion.')) {
+      return this.script.criteriaMet ?? this.noulFor('goal_reached', step, exhausted);
+    }
     if (id.endsWith('?')) return 0.15;
     if (id.startsWith('relevant.')) {
       return id.slice('relevant.'.length) === this.script.tools[step] ? 0.9 : 0.2;
@@ -141,10 +149,19 @@ export class MockJevClient implements JevClient {
       const preferred = options.find((option) => option !== planned && option !== 'done');
       return preferred ?? options[0] ?? '';
     }
+    if (id === 'step_intent') return intentFor(planned, step) ?? options[0] ?? '';
     // Argument questions: take the first real option, skipping the "executor decides" escape hatch.
     const real = options.filter((option) => !option.startsWith('the executor should decide'));
     return real[0] ?? options[0] ?? '';
   }
+}
+
+/** A plausible purpose for the scripted tool, so the executor brief carries a realistic intent. */
+function intentFor(tool: string | undefined, step: number): string | undefined {
+  if (tool === 'edit_file' || tool === 'write_file') return 'change';
+  if (tool === 'run_shell') return 'verify';
+  if (tool === 'read_file') return step === 0 ? 'locate' : 'inspect';
+  return tool ? 'locate' : undefined;
 }
 
 function legend(levels: string[]): Record<string, string> {

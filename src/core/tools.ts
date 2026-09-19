@@ -1,12 +1,14 @@
 import { readFile, writeFile, readdir, stat, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { exec } from 'node:child_process';
+import { exec, type ExecOptions } from 'node:child_process';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 export interface ToolContext {
   workspace: string;
   allowOutsideWorkspace: boolean;
   bashTimeoutMs: number;
+  /** Aborted when the user interrupts a run; long-running tools kill their child process on it. */
+  signal?: AbortSignal;
 }
 
 export interface ToolResult {
@@ -40,6 +42,10 @@ export interface ToolSpec {
   commandArgs?: string[];
   /** Arguments that may be omitted entirely; Jev gets a noul "is this stated?" question. */
   optionalArgs?: string[];
+  /** Tool-specific rules added to the executor's system prompt. */
+  executorHints?: string[];
+  /** The executor must see the target file's current contents to fill this call in correctly. */
+  needsFileContext?: boolean;
   /** 0..1 — how much damage a wrong call can do. Feeds the approval prompt. */
   risk: number;
   /** True when the tool changes the filesystem or runs a process. */
@@ -193,6 +199,10 @@ const readFileTool: ToolSpec = {
   },
   optionalArgs: ['offset', 'limit'],
   pathArgs: ['path'],
+  executorHints: [
+    'Pick the file most likely to hold the code this step is about.',
+    'Leave offset and limit out unless a previous result showed the file is very large.',
+  ],
   risk: 0,
   mutates: false,
   async execute(args, ctx) {
@@ -226,6 +236,12 @@ const writeFileTool: ToolSpec = {
     required: ['path', 'content'],
   },
   pathArgs: ['path'],
+  needsFileContext: true,
+  executorHints: [
+    'content is the complete file exactly as it should end up on disk, from the first line to the last.',
+    'When the file already exists its current contents are shown: keep every part the goal does not ask to change.',
+    'Never abbreviate. A comment like "// ... rest unchanged" is written to disk literally and destroys the file.',
+  ],
   risk: 0.6,
   mutates: true,
   async execute(args, ctx) {
@@ -264,6 +280,12 @@ const editFileTool: ToolSpec = {
   optionalArgs: [],
   closedArgs: { replace_all: ['false', 'true'] },
   pathArgs: ['path'],
+  needsFileContext: true,
+  executorHints: [
+    'Copy old_string character-for-character from the current file contents shown: same indentation, same line breaks, no line numbers.',
+    'Include two or three unchanged neighbouring lines in old_string so it occurs exactly once.',
+    'new_string replaces the whole of old_string, so repeat those neighbouring lines in it unchanged.',
+  ],
   risk: 0.5,
   mutates: true,
   async execute(args, ctx) {
@@ -303,6 +325,7 @@ const listDirTool: ToolSpec = {
   },
   optionalArgs: ['path'],
   pathArgs: ['path'],
+  executorHints: ['Use "." for the workspace root. Directories only, never a file.'],
   risk: 0,
   mutates: false,
   async execute(args, ctx) {
@@ -339,6 +362,7 @@ const globTool: ToolSpec = {
   },
   optionalArgs: ['path'],
   pathArgs: ['path'],
+  executorHints: ['Patterns match paths relative to the workspace root, e.g. "src/**/*.ts". Supports *, **, ? and {a,b}.'],
   risk: 0,
   mutates: false,
   async execute(args, ctx) {
@@ -372,6 +396,10 @@ const grepTool: ToolSpec = {
   },
   optionalArgs: ['path', 'glob', 'ignore_case'],
   pathArgs: ['path'],
+  executorHints: [
+    'pattern is a JavaScript regular expression matched line by line: escape ( ) [ ] { } . * + ? | \\ when you mean them literally.',
+    'Search for an identifier, a string literal or an error message from the history — not a sentence describing the goal.',
+  ],
   risk: 0,
   mutates: false,
   async execute(args, ctx) {
@@ -426,17 +454,34 @@ const runShellTool: ToolSpec = {
     required: ['command'],
   },
   commandArgs: ['command'],
+  executorHints: [
+    'One non-interactive command that exits on its own: no watch mode, no dev servers, no editors, pagers or prompts.',
+    'Prefer the commands this workspace defines. To verify, run the narrowest check that proves the change.',
+  ],
   risk: 0.85,
   mutates: true,
   async execute(args, ctx) {
     const command = String(args['command'] ?? '');
     if (!command.trim()) throw new Error('command must not be empty');
     return await new Promise<ToolResult>((resolvePromise) => {
-      exec(
+      // `detached` puts the command in its own process group, so an interrupt can signal the group
+      // (`-pid`) and take its children down with it. Without it, `-pid` would address *our* group.
+      // `@types/node` omits `detached` from `ExecOptions`, but `exec` forwards it to `spawn`, which
+      // does honour it, so the option is cast rather than dropped.
+      const execOptions: ExecOptions = {
+        cwd: ctx.workspace,
+        timeout: ctx.bashTimeoutMs,
+        maxBuffer: 4 * 1024 * 1024,
+        shell: '/bin/bash',
+      };
+      (execOptions as { detached?: boolean }).detached = true;
+      const child = exec(
         command,
-        { cwd: ctx.workspace, timeout: ctx.bashTimeoutMs, maxBuffer: 4 * 1024 * 1024, shell: '/bin/bash' },
-        (error, stdout, stderr) => {
-          const combined = [stdout, stderr].filter(Boolean).join('\n').trimEnd();
+        execOptions,
+        (error: Error | null, stdout: string | Buffer, stderr: string | Buffer) => {
+          clearTimeout(killTimer);
+          ctx.signal?.removeEventListener('abort', onAbort);
+          const combined = [String(stdout), String(stderr)].filter(Boolean).join('\n').trimEnd();
           const code = error && 'code' in error ? (error as { code?: number }).code : 0;
           resolvePromise({
             ok: !error,
@@ -445,6 +490,29 @@ const runShellTool: ToolSpec = {
           });
         },
       );
+      // `exec`'s own `timeout` only bounds the command, and a TUI interrupt aborts the agent loop
+      // without touching the child — so ctrl-c would leave the command running while the UI claimed
+      // to be stopping it. SIGTERM the group first, SIGKILL it if it ignores that.
+      let killTimer: NodeJS.Timeout | undefined;
+      const onAbort = () => {
+        const pid = child.pid;
+        if (pid === undefined) return;
+        try {
+          process.kill(-pid, 'SIGTERM');
+        } catch {
+          child.kill('SIGTERM');
+        }
+        killTimer = setTimeout(() => {
+          try {
+            process.kill(-pid, 'SIGKILL');
+          } catch {
+            child.kill('SIGKILL');
+          }
+        }, 2000);
+        killTimer.unref();
+      };
+      if (ctx.signal?.aborted) onAbort();
+      else ctx.signal?.addEventListener('abort', onAbort, { once: true });
     });
   },
 };

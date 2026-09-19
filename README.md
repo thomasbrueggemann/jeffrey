@@ -51,7 +51,7 @@ jeffrey --init                     # writes ~/.jeffrey/config.json
   "llm": {
     "baseUrl": "http://localhost:11434/v1",  // Ollama, llama.cpp, LM Studio, vLLM, …
     "apiKey": "not-needed",                  // sentinel is fine for local servers
-    "model": "qwen2.5-coder:7b",
+    "model": "Qwen3.6-35B-A3B-oQ4-mtp",
     "temperature": 0.1,
     "maxTokens": 4096
   },
@@ -89,8 +89,15 @@ cat task.txt | jeffrey --json                           # one JSON event per lin
 ```
 
 The TUI behaves like Claude Code / opencode: frozen step history that scrolls, a live step with
-Jev's confidence and score meters, inline diffs, a status bar, `esc` to abort a run, `ctrl-c` to
-quit, and a prompt that stays open for the next goal.
+Jev's confidence and score meters, inline diffs, a status bar, `esc` to abort a run, and a prompt
+that stays open for the next goal.
+
+| Key | Does |
+| --- | --- |
+| `enter` | Run the goal you typed |
+| `/exit` | Leave (also `/quit`, `/q`) |
+| `ctrl-c` | Leave, or abort the running step if one is in flight |
+| `esc` | Abort the running step |
 
 Mutating tools pause for approval when Jev's risk score is >= 0.5:
 
@@ -222,6 +229,7 @@ Each step the decider asks Jev a batch of questions in one request:
 | `fallback_action` | choice | Second choice if the first turns out unusable |
 | `relevant.<tool>` | noul | Probability each tool is relevant, used to keep the shortlist small |
 | `goal_reached` | noul | Is the goal satisfied? |
+| `criterion.<n>` | noul | Is acceptance criterion *n* met, on the evidence so far? |
 | `progress` | score | 0–4: how much has actually been established |
 | `stuck` | noul | The agent is looping; escalate |
 | `needs_user` | noul | Requires human input; stop and ask |
@@ -232,6 +240,21 @@ Each step the decider asks Jev a batch of questions in one request:
 `act-low-confidence`, `ask-user`, `stuck-escalation` — and only `act` reaches tool execution.
 `stuck-escalation` feeds the recovery ladder described above rather than ending the run.
 
+### Keeping track of the trajectory
+
+Neither model remembers anything between calls, and both only see the last few steps. So the agent
+keeps a **ledger** ([src/core/ledger.ts](src/core/ledger.ts)) and passes it to Jev's state and the
+executor's brief on every step:
+
+- **Acceptance criteria.** Before the first step the executor turns the goal into 2–5 checkable
+  criteria. Jev scores each one every step. `goal-reached` needs all of them met (at or above
+  `agent.criterionMetThreshold`, default 0.6) as well as `goal_reached` and `progress`. Jev choosing
+  `done` is still final. The first open criterion is shown as the `focus`.
+- **Files changed, commands run, failed attempts.** Built from the history by code, not by a model.
+  A command's result is flagged once files have changed since it ran, and a repeated failure is counted.
+- **Facts.** The reporter can end its note with up to two `FACT:` lines. They are kept for the rest
+  of the run and flagged when their file changes afterwards.
+
 ## Layout
 
 ```
@@ -240,6 +263,7 @@ src/config.ts        config schema, defaults, file + env loading, redaction
 src/types.ts         Jev primitives, decisions, events, budget
 src/core/jev.ts      System One client: noul / choice / score questions, retries
 src/core/decider.ts  question composition and answer interpretation
+src/core/ledger.ts   the trajectory: criteria, changes, verifications, failures, facts
 src/core/agent.ts    the loop: gate, plan arguments, approve, execute, narrate
 src/core/tools.ts    tool registry, schemas, execution, diffs
 src/core/llm.ts      OpenAI-compatible streaming client + offline mock

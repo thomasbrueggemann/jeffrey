@@ -1,4 +1,5 @@
 import { readdirSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import type { LlmConfig } from '../config.js';
 
 export type Role = 'system' | 'user' | 'assistant' | 'tool';
@@ -223,11 +224,18 @@ export class MockLlmClient implements LlmClient {
     }
 
     const system = options.messages.find((m) => m.role === 'system')?.content ?? '';
+    if (system.includes('acceptance criteria that define "done"')) {
+      const goal = /^Goal: (.*)$/m.exec(brief)?.[1] ?? 'the goal';
+      const content = `1. The change the goal asks for is in place: ${goal}\n2. A command or file read shows the change working`;
+      await this.stream(content, options);
+      return { content, toolCalls: [], usage, finishReason: 'stop' };
+    }
     const toolName = /Call this tool now:\s*(\w+)/.exec(brief)?.[1];
     const schema = extractTrailingJson(system);
+    const workspace = users.map((m) => /^Workspace: (.*)$/m.exec(m.content ?? '')?.[1]).find(Boolean) ?? process.cwd();
 
     if (toolName && schema) {
-      const args = synthesise(schema, settledFrom(brief), toolName);
+      const args = synthesise(schema, settledFrom(brief), toolName, workspace);
       const reasoning = `Mock executor filling in ${toolName}: ${Object.keys(args).join(', ') || 'no arguments'}`;
       await this.stream(reasoning, options);
 
@@ -295,7 +303,12 @@ function settledFrom(brief: string): Record<string, unknown> {
   return out;
 }
 
-function synthesise(schema: MockSchema, settled: Record<string, unknown>, toolName: string): Record<string, unknown> {
+function synthesise(
+  schema: MockSchema,
+  settled: Record<string, unknown>,
+  toolName: string,
+  workspace: string,
+): Record<string, unknown> {
   const args: Record<string, unknown> = { ...settled };
   const properties = schema.properties ?? {};
   for (const name of schema.required ?? []) {
@@ -305,10 +318,10 @@ function synthesise(schema: MockSchema, settled: Record<string, unknown>, toolNa
       args[name] = property.default;
       continue;
     }
-    args[name] = mockValue(name, property.type, toolName);
+    args[name] = mockValue(name, property.type, toolName, workspace);
   }
   if (toolName === 'edit_file' || toolName === 'multi_edit') {
-    const target = mockEditPair(args['path']);
+    const target = mockEditPair(typeof args['path'] === 'string' ? resolve(workspace, args['path']) : undefined);
     if (target) {
       if (args['old_string'] === undefined) args['old_string'] = target.old;
       if (args['new_string'] === undefined) args['new_string'] = target.next;
@@ -318,8 +331,8 @@ function synthesise(schema: MockSchema, settled: Record<string, unknown>, toolNa
 }
 
 /** An edit the tool will actually accept: the real first line of the target file, and a change to it. */
-function mockEditPair(path: unknown): { old: string; next: string } | undefined {
-  if (typeof path !== 'string') return undefined;
+function mockEditPair(path: string | undefined): { old: string; next: string } | undefined {
+  if (!path) return undefined;
   try {
     const text = readFileSync(path, 'utf8');
     const line = text.split('\n').find((candidate) => candidate.trim().length > 0);
@@ -330,7 +343,7 @@ function mockEditPair(path: unknown): { old: string; next: string } | undefined 
   }
 }
 
-function mockValue(name: string, type: string | undefined, toolName: string): unknown {
+function mockValue(name: string, type: string | undefined, toolName: string, workspace: string): unknown {
   const lower = name.toLowerCase();
   if (type === 'boolean') return false;
   if (type === 'number' || type === 'integer') return 1;
@@ -340,15 +353,15 @@ function mockValue(name: string, type: string | undefined, toolName: string): un
   if (lower.includes('pattern')) return 'mock';
   if (lower.includes('old_string') || lower.includes('old')) return 'export const greet = (name) => `hi ${name}`;';
   if (lower.includes('new_string') || lower.includes('new')) return 'export const greet = (name) => `hello ${name}`;';
-  if (lower.includes('dir') || lower.includes('path') || lower.includes('file')) return mockPath(toolName);
+  if (lower.includes('dir') || lower.includes('path') || lower.includes('file')) return mockPath(toolName, workspace);
   return 'mock';
 }
 
 /** A file for file tools, a directory for `list_dir` — so a mock run does not fail on its own args. */
-function mockPath(toolName: string): string {
+function mockPath(toolName: string, workspace: string): string {
   const wantsDir = toolName === 'list_dir';
   try {
-    const entries = readdirSync(process.cwd(), { withFileTypes: true });
+    const entries = readdirSync(workspace, { withFileTypes: true });
     const dirs = entries.filter((entry) => entry.isDirectory() && !entry.name.startsWith('.'));
     const files = entries.filter((entry) => entry.isFile() && !entry.name.startsWith('.'));
     if (wantsDir) return dirs[0]?.name ?? '.';

@@ -22,6 +22,8 @@ export type Block =
   | { key: string; kind: 'goal'; text: string }
   | { key: string; kind: 'step'; view: StepView }
   | { key: string; kind: 'notice'; level: 'info' | 'warn' | 'error'; message: string }
+  /** A snapshot of the acceptance criteria, appended whenever one changes. */
+  | { key: string; kind: 'criteria'; step: number; criteria: Array<{ id: number; text: string; met: boolean }>; changed: number[] }
   | {
       key: string;
       kind: 'final';
@@ -132,6 +134,16 @@ export function reduce(state: ViewState, action: Action): ViewState {
     case 'budget':
       next.budget = event.budget;
       return next;
+
+    case 'criteria': {
+      // Frozen blocks cannot be updated in place, so each change appends a fresh snapshot.
+      next.blocks = [
+        ...next.blocks,
+        { key: `c${next.seq}`, kind: 'criteria', step: event.step, criteria: event.criteria, changed: event.changed },
+      ];
+      next.seq += 1;
+      return next;
+    }
 
     case 'done': {
       if (next.live) {

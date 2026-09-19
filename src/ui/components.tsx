@@ -295,6 +295,35 @@ export function NoticeBlock({ level, message }: { level: 'info' | 'warn' | 'erro
   );
 }
 
+export function CriteriaBlock({
+  step,
+  criteria,
+  changed,
+}: {
+  step: number;
+  criteria: Array<{ id: number; text: string; met: boolean }>;
+  changed: number[];
+}) {
+  const met = criteria.filter((criterion) => criterion.met).length;
+  return (
+    <Box flexDirection="column" paddingLeft={2} marginTop={step === 0 ? 1 : 0}>
+      <Text color={theme.muted}>
+        {step === 0 ? 'done means' : `criteria before step ${step}`} · {met}/{criteria.length} met
+      </Text>
+      {criteria.map((criterion) => (
+        <Text
+          key={criterion.id}
+          color={criterion.met ? theme.success : theme.text}
+          bold={changed.includes(criterion.id)}
+        >
+          {'  '}
+          {criterion.met ? glyph.done : '○'} {criterion.id}. {truncate(criterion.text, 160)}
+        </Text>
+      ))}
+    </Box>
+  );
+}
+
 const REASON_TITLE: Record<DoneReason, string> = {
   'goal-reached': 'goal reached',
   finished: 'finished',
@@ -354,6 +383,8 @@ export function renderBlock(block: Block, explain: boolean) {
       return <StepBlock view={block.view} explain={explain} />;
     case 'notice':
       return <NoticeBlock level={block.level} message={block.message} />;
+    case 'criteria':
+      return <CriteriaBlock step={block.step} criteria={block.criteria} changed={block.changed} />;
     case 'final':
       return (
         <FinalBlock

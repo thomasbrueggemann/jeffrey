@@ -102,6 +102,10 @@ export interface JevDecision {
   toolRelevance: Record<string, number>;
   /** Which code path in `agent.ts` produced the outcome. */
   route: DecisionRoute;
+  /** Jev's probability that each acceptance criterion is met, keyed by criterion id. */
+  criteria?: Record<string, number>;
+  /** Jev scored the goal as reached, but an acceptance criterion was still open. */
+  criteriaVeto?: boolean;
   /** Raw response, kept for `--explain`. */
   raw: SystemOneResponse;
 }
@@ -173,7 +177,7 @@ export type DoneReason =
   | 'needs-input';
 
 export type AgentEvent =
-  | { type: 'phase'; phase: 'deciding' | 'planning' | 'executing' | 'verifying' }
+  | { type: 'phase'; phase: 'deciding' | 'planning' | 'executing' | 'verifying' | 'approving' }
   | { type: 'decision'; step: number; decision: JevDecision }
   | { type: 'llm-stream'; channel: 'reasoning' | 'narration'; text: string }
   | { type: 'llm-context'; paths: string[]; why: string }
@@ -181,6 +185,7 @@ export type AgentEvent =
   | { type: 'observation'; step: number; tool: string; ok: boolean; output: string; summary: string; diff?: string }
   | { type: 'notice'; level: 'info' | 'warn' | 'error'; message: string }
   | { type: 'budget'; budget: Budget }
+  | { type: 'criteria'; step: number; criteria: Array<{ id: number; text: string; met: boolean }>; changed: number[] }
   | {
       type: 'done';
       reason: DoneReason;

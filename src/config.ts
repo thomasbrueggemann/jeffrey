@@ -13,6 +13,12 @@ export interface LlmConfig {
   headers: Record<string, string>;
   /** Milliseconds before an LLM request is aborted. */
   timeoutMs: number;
+  /**
+   * Characters of workspace context (file contents, recent tool output) the executor brief may
+   * carry. Size it to the model's window: roughly 3–4 characters per token, and leave room for the
+   * answer — a whole rewritten file comes back through `maxTokens`.
+   */
+  contextChars: number;
   /** Use the provider's mock executor instead of a real HTTP call. */
   mock: boolean;
 }
@@ -38,6 +44,8 @@ export interface AgentConfig {
   goalReachedThreshold: number;
   /** Progress score (0..4) that must accompany a goal-reached verdict. */
   minProgressScore: number;
+  /** At or above this probability, an acceptance criterion counts as met. */
+  criterionMetThreshold: number;
   /** At or above this probability, the agent stops and asks the user. */
   needsInputThreshold: number;
   /** At or above this probability, the loop is considered unproductive. */
@@ -74,6 +82,7 @@ export const DEFAULT_CONFIG: Config = {
     maxTokens: 4096,
     headers: {},
     timeoutMs: 300_000,
+    contextChars: 24_000,
     mock: false,
   },
   jev: {
@@ -90,6 +99,7 @@ export const DEFAULT_CONFIG: Config = {
     minConfidence: 0.45,
     goalReachedThreshold: 0.5,
     minProgressScore: 3.5,
+    criterionMetThreshold: 0.6,
     needsInputThreshold: 0.6,
     stuckThreshold: 0.7,
     maxRecoveries: 3,
@@ -144,6 +154,8 @@ function fromEnv(env: NodeJS.ProcessEnv): DeepPartial<Config> {
   if (llmTemp !== undefined) llm.temperature = llmTemp;
   const llmMax = num(env['JEFFREY_LLM_MAX_TOKENS']);
   if (llmMax !== undefined) llm.maxTokens = llmMax;
+  const llmContext = num(env['JEFFREY_LLM_CONTEXT_CHARS']);
+  if (llmContext !== undefined) llm.contextChars = llmContext;
   const llmMock = bool(env['JEFFREY_LLM_MOCK']);
   if (llmMock !== undefined) llm.mock = llmMock;
 
