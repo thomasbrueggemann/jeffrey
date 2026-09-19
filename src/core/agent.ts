@@ -55,7 +55,7 @@ const MAX_ARG_REPAIRS = 2;
  * same budget just burns another full generation (a whole-file write_file at 4096 tokens never fits).
  * So each truncated call doubles the budget, up to this ceiling.
  */
-const MAX_TOKENS_CEILING = 32_768;
+const MAX_TOKENS_CEILING = 65_536;
 
 /**
  * Approvals are usually a bare choice, but a question's approval carries the user's typed answer
@@ -232,6 +232,7 @@ export class Agent {
       // improvise-and-re-ask, a question gets asked, a bad tool name gets corrected. Only a
       // genuinely terminal verdict leaves the loop below.
       let tool: ToolSpec | undefined;
+      const recoveriesAtStepStart = this.recoveries;
       for (let round = 0; !tool; round++) {
         if (round > MAX_ROUNDS_PER_STEP) {
           const summary = `Gave up resolving step ${step} after ${MAX_ROUNDS_PER_STEP} attempts (last route: ${decision.route}).`;
@@ -285,6 +286,15 @@ export class Agent {
           const failure = await reask();
           if (failure) return failure;
           continue;
+        }
+
+        // Jev's stuck score is read off the history, and nothing runs between re-asks within a step,
+        // so the re-ask after a recovery still says "stuck". Escalating on it again climbed the whole
+        // ladder to the hand-off in a second without trying a single move. One recovery per step: if
+        // Jev then picks a real tool, run it — only a new result can show whether the loop broke.
+        const recoveredThisStep = this.recoveries > recoveriesAtStepStart;
+        if (decision.route === 'stuck-escalation' && recoveredThisStep && TOOLS_BY_NAME.has(decision.tool)) {
+          decision = { ...decision, route: 'act' };
         }
 
         if (decision.route === 'stuck-escalation') {
@@ -458,6 +468,8 @@ export class Agent {
       }
 
       const observation = clamp(result.output, config.agent.maxObservationChars);
+      // Otherwise a file written this step is missing from workspace_files for up to three steps.
+      if (tool.mutates) this.fileCacheStep = -1;
       this.record(step, tool.name, args, result.ok, observation, decision.progress);
       this.steps.push({
         step,
@@ -850,12 +862,22 @@ export class Agent {
     intent: string | undefined,
   ): Promise<string> {
     const ok = result.ok;
+    const fallback = `${tool.name} ${ok ? 'succeeded' : 'failed'}: ${observation.slice(0, 200)}`;
+    // The note says what the goal still lacks. Seeing only this one step, the reporter used to claim
+    // that files written two steps earlier were still missing, and Jev went back to re-read them.
+    const files = await listWorkspaceFiles(this.options.config.agent.workspace, 200).catch(() => []);
+    const earlier = this.history.slice(-7, -1);
     const messages: LlmMessage[] = [
       { role: 'system', content: REPORTER_SYSTEM },
       {
         role: 'user',
         content: [
           `Goal: ${this.options.goal}`,
+          `Files in the workspace now: ${files.length ? files.join(', ') : '(none)'}`,
+          ...(earlier.length
+            ? ['Earlier steps:', ...earlier.map((entry) => `  step ${entry.step}: ${entry.tool}(${summariseArgs(entry.args)}) → ${entry.ok ? 'ok' : 'failed'}`)]
+            : []),
+          '',
           ...(intent ? [`Purpose of this step: ${STEP_INTENTS[intent] ?? intent}`] : []),
           `Tool: ${tool.name}(${summariseArgs(args)})`,
           `Result: ${ok ? 'success' : 'failure'}`,
@@ -871,6 +893,7 @@ export class Agent {
     try {
       const result = await this.options.llm.complete({
         messages,
+        maxTokens: this.options.config.llm.noteMaxTokens,
         onToken: (token) => {
           text += token;
           this.options.onEvent({ type: 'llm-stream', channel: 'narration', text });
@@ -881,9 +904,12 @@ export class Agent {
       this.budget.llmPromptTokens += result.usage.promptTokens;
       this.budget.llmCompletionTokens += result.usage.completionTokens;
       this.options.onEvent({ type: 'budget', budget: { ...this.budget } });
-      return (result.content || text).trim();
+      // Cut off means a draft — a thinking model's scratchpad, bullet lists and all. Jev scores
+      // progress from this note, so a plain fact beats half an essay.
+      if (result.finishReason === 'length') return fallback;
+      return (result.content || text).trim() || fallback;
     } catch {
-      return `${tool.name} ${ok ? 'succeeded' : 'failed'}: ${observation.slice(0, 200)}`;
+      return fallback;
     }
   }
 
@@ -936,12 +962,14 @@ export class Agent {
           { role: 'system', content: CRITERIA_SYSTEM },
           { role: 'user', content: `Goal: ${goal}\nWorkspace: ${this.options.config.agent.workspace}` },
         ],
+        maxTokens: this.options.config.llm.noteMaxTokens,
         ...(this.options.signal ? { signal: this.options.signal } : {}),
       });
       this.budget.llmCalls += 1;
       this.budget.llmPromptTokens += result.usage.promptTokens;
       this.budget.llmCompletionTokens += result.usage.completionTokens;
-      const criteria = parseCriteria(result.content);
+      // A cut-off reply is a thinking draft, and its numbered lines are not the criteria.
+      const criteria = result.finishReason === 'length' ? [] : parseCriteria(result.content);
       if (criteria.length) return criteria;
     } catch (error) {
       this.options.onEvent({

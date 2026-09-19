@@ -172,3 +172,46 @@ test('a reply cut off at max_tokens is retried once with a bigger budget, not re
   assert.ok(events.some((e) => e.type === 'notice' && /cut off after \d+ tokens/.test(e.message)));
   assert.equal(await readFile(join(dir, 'src', 'math.ts'), 'utf8'), SOURCE.replace('a - b', 'a + b'));
 });
+
+/** A reporter that is cut off mid-draft, and records what it was shown. */
+class RamblingReporter extends ScriptedExecutor {
+  reporterPrompt = '';
+  reporterBudget: number | undefined;
+  override async complete(options: CompleteOptions): Promise<LlmResult> {
+    if (!options.tools?.length && options.messages.some((m) => /note for the decision model/.test(m.content ?? ''))) {
+      this.reporterPrompt = options.messages.map((m) => m.content).join('\n');
+      this.reporterBudget = options.maxTokens;
+      return { content: '**Analysis:** the user wants a note…', toolCalls: [], usage: { promptTokens: 0, completionTokens: 0 }, finishReason: 'length' };
+    }
+    return super.complete(options);
+  }
+}
+
+test('the reporter sees the workspace, and a cut-off draft never becomes the note', async () => {
+  const llm = new RamblingReporter([{ path: 'src/math.ts', old_string: '  return a - b;', new_string: '  return a + b;' }]);
+  const dir = await workspace();
+  const jev = new MockJevClient({ tools: ['edit_file', 'read_file'] });
+  await new Agent({
+    goal: 'fix the add function in src/math.ts, it subtracts',
+    config: { ...DEFAULT_CONFIG, agent: { ...DEFAULT_CONFIG.agent, workspace: dir, autoApprove: true, maxSteps: 2 } },
+    llm,
+    jev,
+    onEvent: () => {},
+    approve: async () => 'allow',
+  }).run();
+
+  assert.match(llm.reporterPrompt, /Files in the workspace now: .*src\/math\.ts/);
+  assert.equal(llm.reporterBudget, DEFAULT_CONFIG.llm.noteMaxTokens, 'a note never gets the executor budget');
+  const notes = (jev.seenStates as Array<Record<string, unknown>>).map((state) => String(state['agent_notes'] ?? ''));
+  assert.ok(notes.some((note) => note.startsWith('edit_file succeeded')), `expected the plain fallback, got ${JSON.stringify(notes)}`);
+  assert.ok(!notes.some((note) => note.includes('**Analysis')), 'the cut-off draft must not reach Jev');
+});
+
+test('grep with a file as its path searches that file', async () => {
+  const dir = await workspace();
+  const ctx = { workspace: dir, allowOutsideWorkspace: false, bashTimeoutMs: 1000 };
+  const grep = TOOLS_BY_NAME.get('grep')!;
+  const hit = await grep.execute({ pattern: 'return a - b', path: 'src/math.ts' }, ctx);
+  assert.match(hit.output, /src\/math\.ts:2:/);
+  await assert.rejects(grep.execute({ pattern: 'x', path: 'src/nope.ts' }, ctx), /does not exist/);
+});

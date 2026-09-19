@@ -159,3 +159,25 @@ test('saveSessions can be switched off from the environment', () => {
   assert.equal(result.status, 0, `stderr: ${result.stderr}`);
   assert.equal(existsSync(join(home, '.jeffrey', 'sessions')), false);
 });
+
+test('llm.extraBody is merged into the request body', async () => {
+  const { OpenAiCompatibleClient } = await import('../src/core/llm.js');
+  const { DEFAULT_CONFIG } = await import('../src/config.js');
+  const original = globalThis.fetch;
+  let sent: Record<string, unknown> = {};
+  globalThis.fetch = (async (_url: string, init: RequestInit) => {
+    sent = JSON.parse(String(init.body));
+    return new Response('data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n');
+  }) as typeof fetch;
+  try {
+    const client = new OpenAiCompatibleClient({
+      ...DEFAULT_CONFIG.llm,
+      extraBody: { chat_template_kwargs: { enable_thinking: false }, model: 'must-not-win' },
+    });
+    await client.complete({ messages: [{ role: 'user', content: 'hi' }] });
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.deepEqual(sent['chat_template_kwargs'], { enable_thinking: false });
+  assert.equal(sent['model'], DEFAULT_CONFIG.llm.model, 'extraBody cannot override the core fields');
+});

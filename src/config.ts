@@ -9,6 +9,12 @@ export interface LlmConfig {
   model: string;
   temperature: number;
   maxTokens: number;
+  /**
+   * Budget for the short calls — the per-step note and the acceptance criteria. They are a few
+   * sentences, but a thinking model can spiral on them: with the executor's budget, one note took
+   * seven minutes and 32k tokens. Cut off here, the note falls back to a plain result line.
+   */
+  noteMaxTokens: number;
   /** Extra headers, e.g. for a gateway that needs routing metadata. */
   headers: Record<string, string>;
   /** Milliseconds before an LLM request is aborted. */
@@ -21,6 +27,12 @@ export interface LlmConfig {
   contextChars: number;
   /** Use the provider's mock executor instead of a real HTTP call. */
   mock: boolean;
+  /**
+   * Merged into every chat-completions request body, for runtime-specific switches. Qwen3 on a local
+   * server thinks before every answer by default, and the hidden thinking is billed against
+   * `maxTokens`; `{"chat_template_kwargs": {"enable_thinking": false}}` turns that off.
+   */
+  extraBody?: Record<string, unknown>;
 }
 
 export interface JevConfig {
@@ -80,6 +92,7 @@ export const DEFAULT_CONFIG: Config = {
     model: 'qwen2.5-coder:7b',
     temperature: 0.1,
     maxTokens: 4096,
+    noteMaxTokens: 4096,
     headers: {},
     timeoutMs: 300_000,
     contextChars: 24_000,
