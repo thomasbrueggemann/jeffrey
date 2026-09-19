@@ -358,15 +358,21 @@ test('choosing done ends the run even when the goal score is low', async () => {
   assert.ok(notices(result, 'warn').some((message) => /goal score/.test(message)));
 });
 
-test('re-reading a file that has not changed is skipped, and Jev is told why', async () => {
+test('re-reading a file that has not changed is skipped for Jev\'s runner-up, without asking again', async () => {
   // Jev settles read_file on the same path twice in a row; the second is never run.
   const result = await run({ tools: ['read_file', 'read_file', 'list_dir', 'list_dir'] });
 
   const reads = result.events.filter((event) => event.type === 'tool-call' && event.tool === 'read_file');
   assert.equal(reads.length, 1, 'the unchanged file is read once');
   assert.ok(notices(result, 'info').some((message) => /Skipped re-reading .* unchanged since/.test(message)));
-  const steered = result.states.find((state) => String(state.steering ?? '').includes('has not changed since'));
-  assert.ok(steered, 'the re-ask tells Jev the file is unchanged');
-  assert.ok(!offeredTools(steered!).includes('read_file'), 'and does not offer read_file on that decision');
-  assert.ok(offeredTools(result.states.at(-1)!).includes('read_file'), 'read_file comes back afterwards');
+  const reread = result.events.find((event) => event.type === 'tool-call' && event.step === 2 && event.tool === 'read_file');
+  assert.equal(reread, undefined, 'step 2 goes to the runner-up instead');
+  assert.equal(result.states.length, result.events.filter((event) => event.type === 'decision').length, 'one Jev call per decision');
+});
+
+test('the same search again, with no file changed since, is not run', async () => {
+  const result = await run({ tools: ['grep', 'grep', 'list_dir'] });
+  const greps = result.events.filter((event) => event.type === 'tool-call' && event.tool === 'grep');
+  assert.equal(greps.length, 1, 'the identical grep runs once');
+  assert.ok(result.events.some((event) => event.type === 'observation' && event.summary === 'repeat skipped'));
 });

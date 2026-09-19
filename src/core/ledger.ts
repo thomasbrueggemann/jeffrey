@@ -345,7 +345,7 @@ function squash(text: string): string {
 }
 
 /** Models wrap quotes in backticks or quotation marks; the file does not contain those. */
-function unwrapQuote(raw: string): string {
+export function unwrapQuote(raw: string): string {
   let quote = raw.trim();
   const fence = /^(`+|"|')([\s\S]*)\1$/.exec(quote);
   if (fence?.[2]) quote = fence[2].trim();

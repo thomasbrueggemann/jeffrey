@@ -26,11 +26,6 @@ export interface ToolSpec {
   /** JSON Schema for the LLM's function-calling interface. */
   parameters: Record<string, unknown>;
   /**
-   * Arguments with a closed set of values. Jev gets a `choice` question for each of these, so
-   * the decision model — not the LLM — picks which mode or option.
-   */
-  closedArgs?: Record<string, string[]>;
-  /**
    * Arguments that name a workspace path. Jev gets a `choice` over a shortlist of real paths,
    * with an explicit "new path" escape hatch for creating something that does not exist yet.
    */
@@ -42,8 +37,6 @@ export interface ToolSpec {
    * Jev gets a `choice` over them instead of leaving the command entirely to the executor.
    */
   commandArgs?: string[];
-  /** Arguments that may be omitted entirely; Jev gets a noul "is this stated?" question. */
-  optionalArgs?: string[];
   /** Tool-specific rules added to the executor's system prompt. */
   executorHints?: string[];
   /** The executor must see the target file's current contents to fill this call in correctly. */
@@ -179,6 +172,23 @@ export function diffLines(before: string, after: string, path = ''): string {
   return lines.join('\n');
 }
 
+/** Only the changed lines of a `diffLines` diff, with `context` unchanged lines around each run. */
+export function compactDiff(diff: string, context = 1): string {
+  const lines = diff.split('\n').filter((line) => !line.startsWith('--- '));
+  const changed = lines.map((line) => line.startsWith('+') || line.startsWith('-'));
+  const keep = lines.map((_, index) => {
+    for (let k = Math.max(0, index - context); k <= Math.min(lines.length - 1, index + context); k++) if (changed[k]) return true;
+    return false;
+  });
+  const out: string[] = [];
+  keep.forEach((kept, index) => {
+    if (kept) out.push(lines[index]!);
+    else if (out.length && out.at(-1) !== '…') out.push('…');
+  });
+  if (out.at(-1) === '…') out.pop();
+  return out.join('\n');
+}
+
 export function countDiff(diff: string): { added: number; removed: number } {
   let added = 0;
   let removed = 0;
@@ -204,7 +214,6 @@ const readFileTool: ToolSpec = {
     },
     required: ['path'],
   },
-  optionalArgs: ['offset', 'limit'],
   pathArgs: ['path'],
   executorHints: [
     'Pick the file most likely to hold the code this step is about.',
@@ -287,8 +296,6 @@ const editFileTool: ToolSpec = {
     },
     required: ['path', 'old_string', 'new_string'],
   },
-  optionalArgs: [],
-  closedArgs: { replace_all: ['false', 'true'] },
   pathArgs: ['path'],
   needsFileContext: true,
   executorHints: [
@@ -333,7 +340,6 @@ const listDirTool: ToolSpec = {
     type: 'object',
     properties: { path: { type: 'string', description: 'Directory, relative to the workspace root.' } },
   },
-  optionalArgs: ['path'],
   pathArgs: ['path'],
   executorHints: ['Use "." for the workspace root. Directories only, never a file.'],
   risk: 0,
@@ -370,7 +376,6 @@ const globTool: ToolSpec = {
     },
     required: ['pattern'],
   },
-  optionalArgs: ['path'],
   pathArgs: ['path'],
   executorHints: ['Patterns match paths relative to the workspace root, e.g. "src/**/*.ts". Supports *, **, ? and {a,b}.'],
   risk: 0,
@@ -404,7 +409,6 @@ const grepTool: ToolSpec = {
     },
     required: ['pattern'],
   },
-  optionalArgs: ['path', 'glob', 'ignore_case'],
   pathArgs: ['path'],
   executorHints: [
     'pattern is a JavaScript regular expression matched line by line: escape ( ) [ ] { } . * + ? | \\ when you mean them literally.',

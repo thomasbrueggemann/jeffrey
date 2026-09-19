@@ -84,7 +84,7 @@ for (const task of tasks) {
       if (strays.length) console.log(`\n  ! ${runner} wrote ${strays.join(', ')} into ${process.cwd()} instead of its own folder`);
       const result = { task: task.name, runner, run: n, dir, exit, seconds, ...tokens, jev, score: scored };
       results.push(result);
-      console.log(`${fmtTime(seconds)} · ${tokens.requests} requests · ${fmt(tokens.promptTokens + tokens.completionTokens)} tokens · checks ${scored.passed}/${scored.total}${exit.timedOut ? ' · TIMED OUT' : ''}`);
+      console.log(`${fmtTime(seconds)} · ${tokens.requests} requests · ${fmt(tokens.promptTokens + tokens.completionTokens)} tokens (${fmt(tokens.promptTokens - tokens.cachedTokens + tokens.completionTokens)} uncached) · checks ${scored.passed}/${scored.total}${exit.timedOut ? ' · TIMED OUT' : ''}`);
     }
   }
 }
@@ -185,6 +185,7 @@ function meterFor(tag) {
     requests: records.length,
     promptTokens: records.reduce((sum, r) => sum + (r.promptTokens ?? 0), 0),
     completionTokens: records.reduce((sum, r) => sum + (r.completionTokens ?? 0), 0),
+    cachedTokens: records.reduce((sum, r) => sum + (r.cachedTokens ?? 0), 0),
     unmetered: records.filter((r) => !r.metered).length,
     truncated: records.filter((r) => r.finish === 'length').length,
     modelSeconds: records.reduce((sum, r) => sum + (r.ms ?? 0), 0) / 1000,
@@ -217,19 +218,19 @@ function render(results) {
   const lines = [`# Jeffrey vs OpenCode — ${model}${noThink ? ' (thinking off for both)' : ''}`, ''];
 
   // The headline: per runner, summed over every task and run.
-  lines.push('| runner | runs | total time | local LLM tokens | Jev tokens | checks passed |', '|---|---:|---:|---:|---:|---:|');
+  lines.push('| runner | runs | total time | local LLM tokens | uncached local tokens | Jev tokens | checks passed |', '|---|---:|---:|---:|---:|---:|---:|');
   for (const runner of runners) {
     const mine = results.filter((r) => r.runner === runner);
     const sum = (f) => mine.reduce((total, r) => total + f(r), 0);
     lines.push(
-      `| ${runner} | ${mine.length} | ${fmtTime(sum((r) => r.seconds))} | ${fmt(sum((r) => r.promptTokens + r.completionTokens))} | ${runner === 'jeffrey' ? fmt(sum((r) => r.jev.inputTokens + r.jev.outputTokens)) : '—'} | ${sum((r) => r.score.passed)}/${sum((r) => r.score.total)} |`,
+      `| ${runner} | ${mine.length} | ${fmtTime(sum((r) => r.seconds))} | ${fmt(sum((r) => r.promptTokens + r.completionTokens))} | ${fmt(sum((r) => r.promptTokens - (r.cachedTokens ?? 0) + r.completionTokens))} | ${runner === 'jeffrey' ? fmt(sum((r) => r.jev.inputTokens + r.jev.outputTokens)) : '—'} | ${sum((r) => r.score.passed)}/${sum((r) => r.score.total)} |`,
     );
   }
 
-  lines.push('', '| task | run | wall time | LLM requests | prompt tokens | completion tokens | total LLM tokens | cut off | Jev calls / tokens | checks |', '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|');
+  lines.push('', '| task | run | wall time | LLM requests | prompt tokens | of which cached | completion tokens | total LLM tokens | cut off | Jev calls / tokens | checks |', '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|');
   for (const r of results) {
     lines.push(
-      `| ${r.task} | ${r.runner} #${r.run}${r.exit.timedOut ? ' (timed out)' : ''} | ${fmtTime(r.seconds)} | ${r.requests} | ${fmt(r.promptTokens)} | ${fmt(r.completionTokens)} | ${fmt(r.promptTokens + r.completionTokens)} | ${r.truncated} | ${r.jev ? `${r.jev.calls} / ${fmt(r.jev.inputTokens + r.jev.outputTokens)}` : '—'} | ${r.score.passed}/${r.score.total} |`,
+      `| ${r.task} | ${r.runner} #${r.run}${r.exit.timedOut ? ' (timed out)' : ''} | ${fmtTime(r.seconds)} | ${r.requests} | ${fmt(r.promptTokens)} | ${fmt(r.cachedTokens ?? 0)} | ${fmt(r.completionTokens)} | ${fmt(r.promptTokens + r.completionTokens)} | ${r.truncated} | ${r.jev ? `${r.jev.calls} / ${fmt(r.jev.inputTokens + r.jev.outputTokens)}` : '—'} | ${r.score.passed}/${r.score.total} |`,
     );
   }
   lines.push('', 'Failed checks:');

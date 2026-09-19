@@ -5,10 +5,10 @@ import type { AgentEvent, ApprovalChoice, ApprovalRequest, ApprovalResponse, Bud
 import type { Config } from '../config.js';
 import type { LlmClient, LlmMessage } from './llm.js';
 import { Decider, ASK_USER_OPTION, EXECUTOR_DECIDES, FINISH_OPTION, type DeciderContext, type HistoryEntry } from './decider.js';
-import { ACTION_TOOLS, TOOLS_BY_NAME, type ToolContext, type ToolResult, type ToolSpec } from './tools.js';
+import { ACTION_TOOLS, TOOLS_BY_NAME, compactDiff, type ToolContext, type ToolResult, type ToolSpec } from './tools.js';
 import type { JevClient } from './jev.js';
-import { Ledger, containsQuote, parseCriteria, splitFacts } from './ledger.js';
-import { detectTestCommand } from './languages.js';
+import { Ledger, containsQuote, parseCriteria, splitFacts, unwrapQuote } from './ledger.js';
+import { detectTestCommand, localImports } from './languages.js';
 import {
   CRITERIA_SYSTEM,
   REPORTER_SYSTEM,
@@ -19,6 +19,7 @@ import {
   gatherFiles,
   schemaKeys,
   validateArgs,
+  alignEdit,
   type FileContext,
 } from './executor.js';
 
@@ -143,6 +144,14 @@ export class Agent {
   private readonly steps: StepRecord[] = [];
   private readonly allowAlways = new Set<string>();
   private notes = '';
+  /**
+   * What the last failed command showed, until a command runs again. A plain note for the read that
+   * followed used to replace it, and Jev went looking for a cause it had already been told.
+   */
+  private finding = '';
+  private sinceFinding: string[] = [];
+  /** Lines the last step added, offered to Jev as proof for the open criteria on the next decision. */
+  private freshLines: Array<{ path: string; line: string }> = [];
   private fileCache: string[] = [];
   private fileCacheStep = -1;
   /** Loop diagnosis handed to Jev on the next decision. Cleared once it is consumed. */
@@ -183,14 +192,16 @@ export class Agent {
         ok: true;
         decision: JevDecision;
         argChoices: Record<string, string>;
-        argOmitted: Record<string, boolean>;
         intent?: string;
+        thinking?: number;
+        references: string[];
       }
     | { ok: false; message: string }
   > {
     try {
       const result = await this.decider.decide(await this.buildContext(step));
-      this.budget.jevCalls += 2;
+      this.budget.jevCalls += 1;
+      if (result.proofs?.length) this.acceptJevProofs(step, result.proofs);
       this.options.onEvent({ type: 'decision', step, decision: result.decision });
       this.applyCriteria(step, result.decision);
       this.options.onEvent({ type: 'budget', budget: { ...this.budget } });
@@ -281,8 +292,9 @@ export class Agent {
       }
       let decision = first.decision;
       let argChoices = first.argChoices;
-      let argOmitted = first.argOmitted;
       let intent = first.intent;
+      let thinking = first.thinking;
+      let references = first.references;
 
       /** Re-ask within the same step, so a recovery costs Jev calls but not steps. */
       const reask = async (): Promise<{ reason: string; summary: string } | null> => {
@@ -293,8 +305,9 @@ export class Agent {
         }
         decision = next.decision;
         argChoices = next.argChoices;
-        argOmitted = next.argOmitted;
         intent = next.intent;
+        thinking = next.thinking;
+        references = next.references;
         return null;
       };
 
@@ -443,6 +456,25 @@ export class Agent {
         if (reread && !rereadSteered) {
           rereadSteered = true;
           onEvent({ type: 'notice', level: 'info', message: `Skipped re-reading ${reread.path}: read at step ${reread.step} and unchanged since.` });
+          // After a failed command, reading the file again is Jev looking for the cause, and it never
+          // sees a file whole. The executor does: the repair is an edit of that file, briefed with the
+          // file and the failure, not another look.
+          if (this.finding && !this.excludedTools.has('edit_file')) {
+            onEvent({ type: 'notice', level: 'info', message: `Repairing ${reread.path} instead: the failure is in the brief.` });
+            decision = { ...decision, tool: 'edit_file' };
+            argChoices = { 'edit_file.path': reread.path };
+            intent = 'repair';
+            thinking = 1;
+            continue;
+          }
+          // Otherwise Jev's runner-up is its answer with read_file withheld, without asking again. Its
+          // argument answers were for the read, so the executor supplies them.
+          const runnerUp = TOOLS_BY_NAME.get(decision.fallbackTool);
+          if (runnerUp && runnerUp.name !== 'read_file' && !this.excludedTools.has(runnerUp.name)) {
+            decision = { ...decision, tool: runnerUp.name };
+            argChoices = {};
+            continue;
+          }
           this.steering = [
             ...this.steering,
             `${reread.path} was read at step ${reread.step} and has not changed since; reading it again shows nothing new. Its contents are in the history and the notes. Act on it.`,
@@ -508,10 +540,12 @@ export class Agent {
       onEvent({ type: 'phase', phase: 'planning' });
       let args: Record<string, unknown>;
       let extra: Array<Record<string, unknown>> = [];
+      let claimed: Proof[] = [];
       try {
-        const planned = await this.planArguments(tool, decision, { argChoices, argOmitted, intent, steering });
+        const planned = await this.planArguments(tool, decision, { argChoices, intent, steering, thinking, references });
         args = planned.args;
         extra = planned.extra;
+        claimed = planned.proofs;
         if (planned.problems.length) {
           // A call that is known to fail is not run: Jev gets the precise reason instead of a
           // garbled tool error, and a write_file full of "..." never reaches the disk.
@@ -531,6 +565,15 @@ export class Agent {
       // --- approval and execution ---------------------------------------------------------------
       // Usually one call. A batchable tool may bring more from the same reply (a new app's files); each
       // is approved and run on its own, and one note covers them all.
+      // The same search or listing again, with nothing changed since, can only return the same thing.
+      const repeated = this.repeatedLook(tool, args);
+      if (repeated !== undefined) {
+        const observation = `Not run: the same ${toolName} call ran at step ${repeated} and no file has changed since, so its result is the same. Act on it.`;
+        this.record(step, toolName, args, false, observation, decision.progress);
+        onEvent({ type: 'observation', step, tool: toolName, ok: false, output: observation, summary: 'repeat skipped' });
+        this.noteStep(observation);
+        continue;
+      }
       const ran: Array<{ args: Record<string, unknown>; result: ToolResult; observation: string }> = [];
       for (const callArgs of [args, ...extra]) {
         const preview = await this.preview(tool, callArgs, toolCtx);
@@ -581,7 +624,10 @@ export class Agent {
           result = { ok: false, output: `Error: ${(error as Error).message}`, summary: `failed: ${tool.name}` };
         }
 
-        const observation = clamp(result.output, config.agent.maxObservationChars);
+        // What an edit changed, for Jev and the next call: "edited x.py" alone left Jev unable to
+        // tell one edit from the next, and it made the same one three times.
+        const changes = tool.mutates && result.ok && result.diff ? compactDiff(result.diff) : '';
+        const observation = clamp(changes ? `${result.output}\n${changes}` : result.output, config.agent.maxObservationChars);
         // Otherwise a file written this step is missing from workspace_files for up to three steps.
         if (tool.mutates) this.fileCacheStep = -1;
         this.record(step, tool.name, callArgs, result.ok, observation, decision.progress);
@@ -599,7 +645,7 @@ export class Agent {
           step,
           tool: tool.name,
           ok: result.ok,
-          output: observation,
+          output: changes ? clamp(result.output, config.agent.maxObservationChars) : observation,
           summary: result.summary,
           diff: result.diff,
         });
@@ -607,23 +653,44 @@ export class Agent {
       }
       // Denied before anything ran: the step is recorded, there is nothing to narrate.
       if (!ran.length) continue;
+      this.freshLines = ran.flatMap((call) =>
+        call.result.ok && call.result.diff && typeof call.args['path'] === 'string'
+          ? addedLines(call.result.diff).map((line) => ({ path: String(call.args['path']), line }))
+          : [],
+      );
 
       // --- narration ------------------------------------------------------------------------
-      if (this.options.narrate !== false) {
+      // --- the step's note -------------------------------------------------------------------
+      // Only a failed command's output needs reading to know what it showed. A read is already in the
+      // history; a change said in its own call which criteria it meets, and the quotes are checked
+      // against the file here. Both get their result line as the note, at no model call.
+      const summary = ran.map((call) => call.result.summary).join('; ');
+      const proving = ran
+        .filter((call) => call.result.ok && PROVING_TOOLS.has(tool.name) && typeof call.args['path'] === 'string')
+        .map((call) => ({ path: String(call.args['path']), content: this.readWorkspaceFile(String(call.args['path'])) }))
+        .filter((file): file is { path: string; content: string } => file.content !== undefined);
+      // A command that succeeded is said by its exit code, and its output is in the history; only a
+      // failure needs reading to say what went wrong.
+      const failedCommand = tool.name === 'run_shell' && !ran.every((call) => call.result.ok);
+      const change = tool.mutates && tool.name !== 'run_shell' && ran.some((call) => call.result.ok);
+      if (this.options.narrate !== false && failedCommand) {
         onEvent({ type: 'phase', phase: 'verifying' });
-        const proving = ran
-          .filter((call) => call.result.ok && PROVING_TOOLS.has(tool.name) && typeof call.args['path'] === 'string')
-          .map((call) => ({ path: String(call.args['path']), content: this.readWorkspaceFile(String(call.args['path'])) }))
-          .filter((file): file is { path: string; content: string } => file.content !== undefined);
-        const { note, facts, proofs } = splitFacts(await this.narrate(tool, ran, intent, proving));
-        const summary = ran.map((call) => call.result.summary).join('; ');
-        this.notes = note || `${tool.name} → ${summary}`;
-        const paths = ran.map((call) => call.args['path']).filter((p): p is string => typeof p === 'string');
-        this.ledger.addFacts(step, facts, paths);
-        if (proving.length) this.acceptProofs(step, proving, proofs);
+        const { note, facts } = splitFacts(await this.narrate(tool, ran, intent));
+        this.setFinding(note || `${tool.name} → ${summary}`);
+        this.ledger.addFacts(step, facts, []);
+      } else if (this.options.narrate !== false && change) {
+        // After a change Jev needs to hear what the goal still lacks: without it, it went back to
+        // reading files it cannot see whole, and looped. The note sees the diff, not the file.
+        onEvent({ type: 'phase', phase: 'verifying' });
+        const { note, facts, proofs } = splitFacts(await this.narrate(tool, ran, intent));
+        this.noteStep(note || `${tool.name} → ${summary}`);
+        this.ledger.addFacts(step, facts, ran.map((call) => call.args['path']).filter((p): p is string => typeof p === 'string'));
+        if (proving.length && proofs.length) this.acceptProofs(step, proving, proofs);
       } else {
-        this.notes = `${tool.name} → ${ran.map((call) => call.result.summary).join('; ')}`;
+        if (tool.name === 'run_shell') this.setFinding('');
+        this.noteStep(`${tool.name} → ${summary}`);
       }
+      if (proving.length && claimed.length) this.acceptProofs(step, proving, claimed);
     }
 
     return {
@@ -760,11 +827,14 @@ export class Agent {
       minProgressScore: config.agent.minProgressScore,
       needsInputThreshold: config.agent.needsInputThreshold,
       stuckThreshold: config.agent.stuckThreshold,
-      maxRelevantTools: 4,
       dynamicOptions: await this.dynamicOptions(goal),
       steering: this.steering,
       excludeTools: [...this.excludedTools],
-      criteria: this.ledger.criteria.map(({ id, text }) => ({ id, text })),
+      criteria: this.ledger.criteria.map(({ id, text, evidence }) => ({ id, text, ...(evidence ? { proven: true } : {}) })),
+      autoApprove: config.agent.autoApprove,
+      freshLines: this.freshLines,
+      referenceCandidates: this.referenceCandidates(),
+      askEffort: Boolean(config.llm.quickExtraBody) && config.llm.executorThinking === 'jev',
       criterionMetThreshold: config.agent.criterionMetThreshold,
       ledger: this.ledger.view(step),
     };
@@ -778,7 +848,7 @@ export class Agent {
   private async dynamicOptions(goal: string): Promise<Record<string, string[]>> {
     const { workspace } = this.options.config.agent;
     const candidates = rankFiles(this.fileCache, goal).slice(0, 10);
-    const scripts = await detectScripts(workspace);
+    const scripts = await detectScripts(workspace, this.testCommand());
 
     const options: Record<string, string[]> = {};
     if (candidates.length) {
@@ -811,33 +881,44 @@ export class Agent {
     decision: JevDecision,
     jev: {
       argChoices: Record<string, string>;
-      argOmitted: Record<string, boolean>;
       intent: string | undefined;
       steering: string[];
+      thinking?: number | undefined;
+      references: string[];
     },
-  ): Promise<{ args: Record<string, unknown>; problems: string[]; extra: Array<Record<string, unknown>> }> {
+  ): Promise<{ args: Record<string, unknown>; problems: string[]; extra: Array<Record<string, unknown>>; proofs: Proof[] }> {
     const { config, goal } = this.options;
     const { workspace } = config.agent;
     const settled: Record<string, string> = {};
-    const omitted: string[] = [];
     for (const [key, value] of Object.entries(jev.argChoices)) {
       if (key.startsWith(`${tool.name}.`)) settled[key.slice(tool.name.length + 1)] = value;
     }
-    for (const [key, isOmitted] of Object.entries(jev.argOmitted)) {
-      if (isOmitted && key.startsWith(`${tool.name}.`)) omitted.push(key.slice(tool.name.length + 1));
+
+    // Jev settled every argument the call needs: a path it picked from the workspace, a command the
+    // project defines. The executor would only copy them out again, at the price of a whole brief. It
+    // runs when something is left to write, or when steering could change the call.
+    const required = (tool.parameters['required'] ?? []) as string[];
+    if (!jev.steering.length && required.length && required.every((key) => key in settled)) {
+      const direct: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(settled)) direct[key] = coerce(value, tool, key);
+      if (!validateArgs(tool, direct, workspace).length) return { args: direct, problems: [], extra: [], proofs: [] };
     }
 
     const budget = config.llm.contextChars;
     const candidates = rankFiles(this.fileCache, goal).slice(0, 8);
-    const scripts = tool.commandArgs?.length ? await detectScripts(workspace) : [];
+    const scripts = tool.commandArgs?.length ? await detectScripts(workspace, this.testCommand()) : [];
     const stage = decision.progressLegend[String(Math.round(decision.progress))];
     const gather = (paths: Record<string, string>) =>
-      gatherFiles({ tool, settled: paths, history: this.history, candidates, workspace, budget: Math.floor(budget * 0.6) });
+      gatherFiles({ tool, settled: paths, history: this.history, candidates, workspace, budget: Math.floor(budget * 0.6), references: jev.references });
 
     let files = gather(settled);
     this.announceContext(files, jev.intent);
 
     const forced = (this.options.toolMode ?? 'forced') === 'forced';
+    // A change can say which criteria it meets in the same call: whoever writes the line knows what it
+    // is for. That replaced a note call after every change whose main job was finding those lines.
+    const open = PROVING_TOOLS.has(tool.name) && tool.mutates ? this.ledger.criteria.filter((criterion) => !criterion.evidence) : [];
+    let proofs: Proof[] = [];
     let args: Record<string, unknown> = {};
     let problems: string[] = [];
     let more: Array<Record<string, unknown>> = [];
@@ -845,10 +926,21 @@ export class Agent {
     // reply cut off by runaway thinking is not cured by a bigger budget to think in. With that retry
     // available, the first attempt only gets room for its answer plus a thinking allowance.
     const quickBody = config.llm.quickExtraBody;
-    let quick = false;
-    let maxTokens = quickBody
-      ? Math.min(config.llm.maxTokens, config.llm.thinkingAllowance + answerEstimate(tool, files))
-      : config.llm.maxTokens;
+    const thinkingBudget = () => Math.min(config.llm.maxTokens, config.llm.thinkingAllowance + answerEstimate(tool, files));
+    // Thinking is kept for the calls that need it: after a failure, or a step Jev calls a repair.
+    // `jev`: Jev judged whether this step needs careful reasoning. Either way, a rejected quick
+    // attempt is retried with thinking.
+    const mode = config.llm.executorThinking;
+    const thinkOnFailure = Boolean(quickBody) && mode !== 'always';
+    const struggling =
+      mode === 'jev' && jev.thinking !== undefined
+        ? jev.thinking >= 0.5
+        : this.history.at(-1)?.ok === false || jev.intent === 'repair';
+    // Only a call that writes code has anything to think about; a path, a pattern or a command is
+    // copied from the brief, and grep once thought for 800 tokens to answer in 13.
+    const writesCode = tool.mutates && Boolean(tool.pathArgs?.length);
+    let quick = Boolean(quickBody) && (!writesCode || (thinkOnFailure && !struggling));
+    let maxTokens = quick || !quickBody ? config.llm.maxTokens : thinkingBudget();
 
     for (let attempt = 0; attempt <= MAX_ARG_REPAIRS; attempt++) {
       const messages: LlmMessage[] = [
@@ -870,28 +962,41 @@ export class Agent {
             ledger: this.ledger.view(this.budget.steps, Math.floor(budget * 0.1)),
           }),
         },
-        { role: 'user', content: callMessage(tool, settled, omitted, problems) },
+        { role: 'user', content: callMessage(tool, settled, problems, open) },
       ];
 
       let parsed: Record<string, unknown> | undefined;
       let truncated = false;
       const extraBody = quick ? quickBody : undefined;
-      if (forced) ({ parsed, truncated, more } = await this.llmCall(messages, tool, 'forced', maxTokens, extraBody));
+      if (forced) ({ parsed, truncated, more } = await this.llmCall(messages, tool, 'forced', maxTokens, extraBody, open.length > 0));
       // The JSON fallback would be cut off at the same budget; go straight to a bigger one instead.
-      if (!parsed && !truncated) ({ parsed, truncated } = await this.llmCall(messages, tool, 'prompt', maxTokens, extraBody));
+      if (!parsed && !truncated) ({ parsed, truncated } = await this.llmCall(messages, tool, 'prompt', maxTokens, extraBody, open.length > 0));
 
+      proofs = [parsed, ...more].flatMap((call) => parseProofs(call?.[PROOF_ARG]));
       args = schemaKeys(tool, parsed ?? {});
+      const proposed = typeof args['path'] === 'string' ? args['path'] : undefined;
       for (const [key, value] of Object.entries(settled)) {
         args[key] = coerce(value, tool, key);
       }
-      for (const key of omitted) {
-        if (args[key] === undefined || args[key] === null) delete args[key];
-      }
+      // A change aimed at another file than the one Jev settled would be applied to the settled one,
+      // and fail there as an old_string that "does not occur". When the executor names a file it was
+      // shown, it has read the code and Jev has not: the fix for a crash in one file is often in the
+      // module it calls. Its choice stands. A file it was not shown is sent back.
+      const proposedRel = proposed ? relative(workspace, resolve(workspace, proposed)) : undefined;
+      const retarget = tool.mutates && settled['path'] && proposedRel && proposedRel !== settled['path'];
+      const seen = retarget && files.some((file) => file.path === proposedRel && file.exists);
+      if (seen) args['path'] = proposedRel;
+      const elsewhere = retarget && !seen;
+      if (tool.name === 'edit_file' && !elsewhere) args = alignEdit(args, workspace);
 
       if (truncated && !parsed) {
         problems = [`The reply was cut off after ${maxTokens} tokens, before the tool call was complete.`];
       } else {
-        problems = parsed ? validateArgs(tool, args, workspace) : ['The reply contained no tool call and no JSON arguments.'];
+        problems = !parsed
+          ? ['The reply contained no tool call and no JSON arguments.']
+          : elsewhere
+            ? [`This step changes ${settled['path']}, not ${proposed}; the other files are shown for reference. Put the change in ${settled['path']}.`]
+            : validateArgs(tool, args, workspace);
       }
       if (!problems.length) break;
       if (attempt === MAX_ARG_REPAIRS) break;
@@ -900,11 +1005,18 @@ export class Agent {
         if (maxTokens >= MAX_TOKENS_CEILING) break;
         maxTokens = Math.min(maxTokens * 2, MAX_TOKENS_CEILING);
         problems = [...problems, `Your token budget is now ${maxTokens}. Keep the reply to the tool call alone.`];
+        quick = Boolean(quickBody);
       } else if (truncated) {
         // The capped first attempt ran out while thinking; without thinking it gets the full budget.
         maxTokens = config.llm.maxTokens;
+        quick = true;
+      } else if (thinkOnFailure && writesCode && quick && attempt === 0) {
+        // A quick attempt got it wrong: the retry gets to think.
+        quick = false;
+        maxTokens = thinkingBudget();
+      } else {
+        quick = Boolean(quickBody);
       }
-      quick = Boolean(quickBody);
 
       this.options.onEvent({
         type: 'notice',
@@ -944,7 +1056,7 @@ export class Agent {
         extra.push(call);
       }
     }
-    return { args, problems, extra };
+    return { args, problems, extra, proofs };
   }
 
   private announceContext(files: FileContext[], intent: string | undefined): void {
@@ -962,6 +1074,7 @@ export class Agent {
     mode: ToolMode,
     maxTokens: number,
     extraBody?: Record<string, unknown>,
+    withProofs = false,
   ): Promise<{ parsed: Record<string, unknown> | undefined; truncated: boolean; more: Array<Record<string, unknown>> }> {
     let buffer = '';
     const onToken = (token: string) => {
@@ -970,7 +1083,7 @@ export class Agent {
     };
     const spec = {
       type: 'function' as const,
-      function: { name: tool.name, description: tool.description, parameters: tool.parameters },
+      function: { name: tool.name, description: tool.description, parameters: withProofs ? withProofArg(tool.parameters) : tool.parameters },
     };
 
     const result =
@@ -991,7 +1104,7 @@ export class Agent {
                 role: 'user',
                 content:
                   'Reply with a single JSON object and nothing else: {"arguments": { ... }}. ' +
-                  'No markdown fence, no explanation.',
+                  `No markdown fence, no explanation.\n\nTool schema for ${tool.name}:\n${JSON.stringify(tool.parameters, null, 2)}`,
               },
             ],
             maxTokens,
@@ -1029,12 +1142,9 @@ export class Agent {
     tool: ToolSpec,
     ran: Array<{ args: Record<string, unknown>; result: ToolResult; observation: string }>,
     intent: string | undefined,
-    files: Array<{ path: string; content: string }>,
   ): Promise<string> {
-    const ok = ran.every((call) => call.result.ok);
-    const open = files.length ? this.ledger.criteria.filter((criterion) => !criterion.evidence) : [];
-    // Split across the files so several written in one step still fit the note's budget.
-    const perFile = Math.floor(16_000 / Math.max(1, files.length));
+    const changed = tool.mutates && PROVING_TOOLS.has(tool.name) && ran.some((call) => call.result.ok);
+    const open = changed ? this.ledger.criteria.filter((criterion) => !criterion.evidence) : [];
     const fallback = ran
       .map((call) => `${tool.name} ${call.result.ok ? 'succeeded' : 'failed'}: ${call.observation.slice(0, 200)}`)
       .join('\n');
@@ -1042,7 +1152,6 @@ export class Agent {
     // that files written two steps earlier were still missing, and Jev went back to re-read them.
     const workspaceFiles = await listWorkspaceFiles(this.options.config.agent.workspace, 200).catch(() => []);
     const earlier = this.history.slice(-(6 + ran.length), -ran.length);
-    const names = files.map((file) => file.path).join(', ');
     const messages: LlmMessage[] = [
       { role: 'system', content: REPORTER_SYSTEM },
       {
@@ -1060,19 +1169,18 @@ export class Agent {
             `Result: ${call.result.ok ? 'success' : 'failure'}`,
             '',
             call.observation,
-            // An edit's output is "replaced 1 occurrence(s)"; the diff is the actual evidence.
-            ...(call.result.diff && !open.length ? ['', 'Diff:', clamp(call.result.diff, 3000)] : []),
             '',
           ]),
+          // A change's observation carries its diff: enough to say what it did and which criteria the
+          // lines it added prove, without the whole file.
           ...(open.length
             ? [
-                ...files.flatMap((file) => [`Current contents of ${file.path}:`, '```', clamp(file.content, perFile), '```', '']),
                 'Open acceptance criteria:',
                 ...open.map((criterion) => `  ${criterion.id}. ${criterion.text}`),
                 '',
-                `After the note, for each open criterion the contents of ${names} prove, add a line`,
-                'MET <id>: <one line copied character for character from the file above that shows it>',
-                'Check every open criterion against every file shown. Only criteria these files really prove; no line for the others.',
+                'After the note, for each open criterion a line added above proves, add a line',
+                'MET <id>: <that line, copied character for character without the leading +>',
+                'Only criteria the added lines really prove; no line for the others.',
               ]
             : []),
         ].join('\n'),
@@ -1241,12 +1349,67 @@ export class Agent {
     const observation = clamp(result.output, config.agent.maxObservationChars);
     this.record(step, tool.name, args, result.ok, observation, 0);
     onEvent({ type: 'observation', step, tool: tool.name, ok: result.ok, output: observation, summary: result.summary });
-    this.notes = result.ok
-      ? `\`${command}\` passes.`
-      : `Every criterion's code is in the files, but \`${command}\` fails, so something is wrong. Output:\n${clamp(result.output, 1500)}`;
+    this.setFinding(
+      result.ok ? '' : `Every criterion's code is in the files, but \`${command}\` fails, so something is wrong. Output:\n${clamp(result.output, 1500)}`,
+    );
+    if (result.ok) this.noteStep(`\`${command}\` passes.`);
     // A baseline or gate run is a fact about the project, not a failed attempt by the agent.
     if (!result.ok) this.ledger.forgetFailure('run_shell', args);
     return result.ok ? 'passed' : 'failed';
+  }
+
+  /** Jev's picks from the lines the last step wrote, checked like any other proof. */
+  private acceptJevProofs(step: number, proofs: Array<{ id: number; path: string; quote: string }>): void {
+    const byPath = new Map<string, Array<{ id: number; quote: string }>>();
+    for (const proof of proofs) byPath.set(proof.path, [...(byPath.get(proof.path) ?? []), proof]);
+    for (const [path, claims] of byPath) {
+      const content = this.readWorkspaceFile(path);
+      if (content !== undefined) this.acceptProofs(step, [{ path, content }], claims);
+    }
+  }
+
+  /** What the likeliest targets import: the files Jev is asked about before they cost executor tokens. */
+  private referenceCandidates(): string[] {
+    const { workspace } = this.options.config.agent;
+    const candidates = rankFiles(this.fileCache, this.options.goal).slice(0, 3);
+    const found: string[] = [];
+    for (const path of candidates) {
+      const content = this.readWorkspaceFile(path);
+      if (content === undefined) continue;
+      for (const imported of localImports(workspace, path, content)) {
+        if (!found.includes(imported) && !candidates.includes(imported)) found.push(imported);
+      }
+    }
+    return found.slice(0, 4);
+  }
+
+  private setFinding(finding: string): void {
+    this.finding = finding;
+    this.sinceFinding = [];
+    this.notes = finding;
+  }
+
+  /** A step's one-line note, kept under the standing finding when there is one. */
+  private noteStep(line: string): void {
+    if (!this.finding) {
+      this.notes = line;
+      return;
+    }
+    this.sinceFinding = [...this.sinceFinding, line].slice(-3);
+    this.notes = `${this.finding}\nSince then:\n${this.sinceFinding.map((entry) => `- ${entry}`).join('\n')}`;
+  }
+
+  /** An earlier successful run of exactly this read-only call, with no change to any file since. */
+  private repeatedLook(tool: ToolSpec, args: Record<string, unknown>): number | undefined {
+    if (tool.mutates) return undefined;
+    const canonical = (value: Record<string, unknown>) => JSON.stringify(Object.keys(value).sort().map((key) => [key, value[key]]));
+    const signature = canonical(args);
+    for (let index = this.history.length - 1; index >= 0; index--) {
+      const entry = this.history[index]!;
+      if (MUTATING_TOOLS.has(entry.tool) && entry.ok) return undefined;
+      if (entry.tool === tool.name && entry.ok && canonical(entry.args) === signature) return entry.step;
+    }
+    return undefined;
   }
 
   /** The configured test command, else the detected one; `false` in the config turns it off. */
@@ -1414,21 +1577,26 @@ const STOP_WORDS = new Set([
 ]);
 
 /** The workspace's own vocabulary of runnable commands, if it declares any. */
-async function detectScripts(root: string): Promise<string[]> {
-  const commands: string[] = [];
+/**
+ * Commands the workspace defines. The project's test command comes first, and is the only spelling
+ * of it: with `npm run test` also on offer, Jev picked that as often as `npm test`, and the ledger
+ * never matched the two, so the gate ran the tests again.
+ */
+async function detectScripts(root: string, tests?: string): Promise<string[]> {
+  const commands: string[] = tests ? [tests] : [];
   try {
     const pkg = JSON.parse(await readFile(join(root, 'package.json'), 'utf8')) as {
       scripts?: Record<string, string>;
     };
     for (const name of Object.keys(pkg.scripts ?? {})) {
-      commands.push(`npm run ${name}`);
+      if (!(tests && name === 'test')) commands.push(`npm run ${name}`);
     }
   } catch {
     // no package.json, or it is unreadable
   }
   if (existsSync(join(root, 'Makefile'))) commands.push('make');
-  if (existsSync(join(root, 'pyproject.toml'))) commands.push('python -m pytest');
-  return commands.slice(0, 8);
+  if (!tests && existsSync(join(root, 'pyproject.toml'))) commands.push('python -m pytest');
+  return [...new Set(commands)].slice(0, 8);
 }
 
 async function listWorkspaceFiles(root: string, limit: number): Promise<string[]> {
@@ -1470,4 +1638,43 @@ function namesFile(criterion: string, path: string, existing: Set<string>): bool
 
 function baseName(path: string): string {
   return path.split(/[\\/]/).pop()!.toLowerCase();
+}
+
+type Proof = { id: number; quote: string };
+
+/** The extra argument a change may carry: which open criteria it meets, and the line that shows it. */
+const PROOF_ARG = 'criteria_met';
+
+function withProofArg(parameters: Record<string, unknown>): Record<string, unknown> {
+  const properties = (parameters['properties'] ?? {}) as Record<string, unknown>;
+  return {
+    ...parameters,
+    properties: {
+      ...properties,
+      [PROOF_ARG]: {
+        type: 'array',
+        items: { type: 'string' },
+        description:
+          'For each open acceptance criterion this call makes true: "<id>: <one line of the file after this call, copied exactly>". Leave it empty when the call meets none.',
+      },
+    },
+  };
+}
+
+function parseProofs(value: unknown): Proof[] {
+  const entries = Array.isArray(value) ? value : typeof value === 'string' ? value.split('\n') : [];
+  return entries.flatMap((entry) => {
+    const match = /^\s*#?(\d+)\s*[:.)-]\s*(.+)$/s.exec(String(entry));
+    return match?.[1] && match[2] ? [{ id: Number(match[1]), quote: unwrapQuote(match[2]) }] : [];
+  });
+}
+
+/** The lines a diff adds, long enough to prove something, each once. */
+function addedLines(diff: string): string[] {
+  const lines = diff
+    .split('\n')
+    .filter((line) => line.startsWith('+') && !line.startsWith('+++'))
+    .map((line) => line.slice(1).trim())
+    .filter((line) => line.replace(/\s/g, '').length >= 8);
+  return [...new Set(lines)];
 }

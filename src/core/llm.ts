@@ -30,6 +30,8 @@ export interface LlmToolSpec {
 export interface LlmUsage {
   promptTokens: number;
   completionTokens: number;
+  /** Prompt tokens the server reused from its prefix cache, when it reports them. */
+  cachedTokens?: number;
 }
 
 export interface LlmResult {
@@ -142,6 +144,7 @@ async function readStream(
       usage = {
         promptTokens: chunk.usage.prompt_tokens ?? 0,
         completionTokens: chunk.usage.completion_tokens ?? 0,
+        cachedTokens: chunk.usage.prompt_tokens_details?.cached_tokens ?? 0,
       };
     }
 
@@ -235,7 +238,10 @@ export class MockLlmClient implements LlmClient {
       return { content, toolCalls: [], usage, finishReason: 'stop' };
     }
     const toolName = /Call this tool now:\s*(\w+)/.exec(brief)?.[1];
-    const schema = extractTrailingJson(system);
+    const schema =
+      (options.tools?.[0]?.function.parameters as MockSchema | undefined) ??
+      extractTrailingJson(options.messages.at(-1)?.content ?? '') ??
+      extractTrailingJson(system);
     const workspace = users.map((m) => /^Workspace: (\/.*)$/m.exec(m.content ?? '')?.[1]).find(Boolean) ?? process.cwd();
 
     if (toolName && schema) {

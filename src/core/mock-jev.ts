@@ -80,14 +80,24 @@ export class MockJevClient implements JevClient {
             confidence,
           };
           break;
-        case 'choice':
+        case 'choice': {
+          const picked = this.choiceFor(id, question.criteria, planned, exhausted, step);
+          // next_action's runner-up is the agent's fallback: a plausible second option, or the
+          // scripted hallucination when the script asks for the fallback to be one too.
+          const second =
+            id === 'next_action'
+              ? this.script.hallucinateFallback && this.script.hallucinations?.[step]
+                ? this.script.hallucinations[step]
+                : Object.keys(question.criteria).find((option) => option !== picked && option !== planned && option !== 'done')
+              : undefined;
           answers[id] = {
             type: 'choice',
-            choice: this.choiceFor(id, question.criteria, planned, exhausted, step),
-            probabilities: {},
+            choice: picked,
+            probabilities: second ? { [picked]: confidence, [second]: Math.max(0, 1 - confidence) / 2 } : {},
             confidence,
           };
           break;
+        }
       }
     }
 

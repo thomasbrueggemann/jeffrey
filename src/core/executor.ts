@@ -64,6 +64,7 @@ Rules:
   the one where that part of the work belongs, not the one the goal happens to mention first.
 - Nothing that can only be shown by an absence ("uses no framework", "makes no network requests").
 - Cover what the goal asks for and how it will be shown to work. Do not invent extra scope.
+- When the goal asks for tests as well, one criterion is about the test file and what it checks.
 - No preamble, no explanation.`;
 
 /** Jev's answer to "what is this call for?", phrased for the executor. */
@@ -109,44 +110,23 @@ export function executorSystem(tool: ToolSpec, extra?: string): string {
   if (tool.executorHints?.length) {
     parts.push(`For ${tool.name}:\n${tool.executorHints.map((hint) => `- ${hint}`).join('\n')}`);
   }
-  // The schema stays last: the mock executor reads it back as the trailing JSON object.
-  parts.push(`Tool schema:\n${JSON.stringify(tool.parameters, null, 2)}`);
+  // No schema here: the request's tool definition carries it, and a JSON-mode retry appends it.
   return parts.join('\n\n');
 }
 
 export function buildBrief(input: BriefInput): string {
+  // Ordered from what changes least to what changes every step, so consecutive calls share a long
+  // prefix a server can serve from its cache: the goal, the files and their contents, the ledger and
+  // history, and only then what this one step is for.
   // No absolute workspace path: shown one, a small model writes absolute paths and garbles them
   // (a dropped directory once sent a whole file outside the workspace, refused, and rewritten).
   const lines = [`Goal: ${input.goal}`, 'Workspace: the current folder. Every path is relative to it, e.g. index.html or src/app.ts.'];
-  if (input.intent) lines.push(`This step is for: ${STEP_INTENTS[input.intent] ?? input.intent}`);
-  if (input.stage) lines.push(`Where the work stands: ${input.stage}`);
-
-  if (input.steering.length) {
-    lines.push('', 'The decision model was told this before choosing, and it applies to you too:');
-    for (const entry of input.steering) lines.push(indent(entry));
-  }
 
   if (input.candidates.length) {
     lines.push('', `Files most likely relevant: ${input.candidates.join(', ')}`);
   }
   if (input.scripts.length) {
     lines.push(`Commands this workspace defines: ${input.scripts.join(', ')}`);
-  }
-
-  const ledger = input.ledger ? describeLedger(input.ledger) : [];
-  if (ledger.length) lines.push('', ...ledger);
-
-  const history = input.history.slice(-8);
-  lines.push('', history.length ? 'History so far:' : 'No steps have run yet.');
-  for (const entry of history) {
-    lines.push(`  step ${entry.step}: ${entry.tool}(${summariseArgs(entry.args)}) → ${entry.ok ? 'ok' : 'failed'} — ${firstLine(entry.observation)}`);
-  }
-
-  // A one-liner is enough to follow the story, but not to act on: the last result is usually the
-  // very thing this call has to use (the grep hit, the compiler error, the failing assertion).
-  for (const entry of history.slice(-2)) {
-    if (!entry.observation.includes('\n') && entry.observation.length <= 160) continue;
-    lines.push('', `Full result of step ${entry.step} (${entry.tool}):`, fence(clamp(entry.observation, input.observationChars)));
   }
 
   for (const file of input.files) {
@@ -163,12 +143,52 @@ export function buildBrief(input: BriefInput): string {
     );
   }
 
+  const ledger = input.ledger ? describeLedger(input.ledger) : [];
+  if (ledger.length) lines.push('', ...ledger);
+
+  const history = input.history.slice(-8);
+  lines.push('', history.length ? 'History so far:' : 'No steps have run yet.');
+  for (const entry of history) {
+    lines.push(`  step ${entry.step}: ${entry.tool}(${summariseArgs(entry.args)}) → ${entry.ok ? 'ok' : 'failed'} — ${firstLine(entry.observation)}`);
+  }
+
+  // A one-liner is enough to follow the story, but not to act on: the last result is usually the
+  // very thing this call has to use (the grep hit, the compiler error, the failing assertion).
+  const shown = new Set(input.files.filter((file) => file.exists && !file.truncated).map((file) => file.path));
+  for (const entry of history.slice(-2)) {
+    if (!entry.observation.includes('\n') && entry.observation.length <= 160) continue;
+    // A read of a file whose current contents are shown above is the same text again, with line
+    // numbers a copied old_string then carries.
+    if (entry.tool === 'read_file' && shown.has(String(entry.args['path'] ?? ''))) continue;
+    lines.push('', `Full result of step ${entry.step} (${entry.tool}):`, fence(clamp(entry.observation, input.observationChars)));
+  }
+
+  // The last command failure is what a repair has to fix, and a read or two after it pushes it out of
+  // the window above. It stays until another command runs.
+  const lastCommand = input.history.findLast((entry) => entry.tool === 'run_shell');
+  if (lastCommand && !lastCommand.ok && !history.slice(-2).includes(lastCommand)) {
+    lines.push('', `Output of the command that failed at step ${lastCommand.step}:`, fence(clamp(lastCommand.observation, input.observationChars)));
+  }
+
   if (input.notes) lines.push('', `Note from the last step: ${input.notes}`);
+
+  if (input.intent || input.stage) lines.push('');
+  if (input.intent) lines.push(`This step is for: ${STEP_INTENTS[input.intent] ?? input.intent}`);
+  if (input.stage) lines.push(`Where the work stands: ${input.stage}`);
+  if (input.steering.length) {
+    lines.push('', 'The decision model was told this before choosing, and it applies to you too:');
+    for (const entry of input.steering) lines.push(indent(entry));
+  }
   return lines.join('\n');
 }
 
 /** The instruction turn. Repeated in full on a repair so a small model does not lose the thread. */
-export function callMessage(tool: ToolSpec, settled: Record<string, string>, omitted: string[], problems: string[] = []): string {
+export function callMessage(
+  tool: ToolSpec,
+  settled: Record<string, string>,
+  problems: string[] = [],
+  open: Array<{ id: number; text: string }> = [],
+): string {
   const keys = Object.keys(settled);
   const lines = [`Call this tool now: ${tool.name}`, ''];
   if (keys.length) {
@@ -177,13 +197,18 @@ export function callMessage(tool: ToolSpec, settled: Record<string, string>, omi
   } else {
     lines.push('The decision model settled no arguments; you must supply all of them.');
   }
-  if (omitted.length) {
-    lines.push('', `Omit these optional arguments entirely so the tool default applies: ${omitted.join(', ')}`);
-  }
   if (problems.length) {
     lines.push('', 'Your previous call for this step was rejected before it ran:');
     for (const problem of problems) lines.push(`  - ${problem}`);
     lines.push('Fix exactly these problems and produce the call again.');
+  }
+  if (open.length) {
+    lines.push('', 'Acceptance criteria not yet shown to be met:');
+    for (const criterion of open) lines.push(`  ${criterion.id}. ${criterion.text}`);
+    lines.push(
+      'In criteria_met, list each one this call makes true as "<id>: <a line of the file after this call, copied exactly>".',
+      'Only criteria this call really meets; leave it empty otherwise.',
+    );
   }
   lines.push('', 'Produce the tool call.');
   return lines.join('\n');
@@ -195,6 +220,8 @@ export function callMessage(tool: ToolSpec, settled: Record<string, string>, omi
  * then the best-ranked candidate, so an unsettled `edit_file` still has something real to copy from.
  */
 export function gatherFiles(input: {
+  /** Imported files Jev judged this call needs; when absent, every import is shown. */
+  references?: string[];
   tool: ToolSpec;
   settled: Record<string, string>;
   history: HistoryEntry[];
@@ -238,10 +265,14 @@ export function gatherFiles(input: {
   // What the target imports from the project. A change that calls into another module has to know
   // what that module offers: shown only server.js, the executor called a store.update() that
   // notes.js never had, and every PATCH was a 500.
+  // Which of them is worth its tokens is Jev's call, when it was asked: everything shown here is
+  // prompt the executor pays for on every attempt.
   const target = out.find((file) => file.exists);
   if (target) {
+    const wanted = input.references;
     for (const path of localImports(workspace, target.path, target.content)) {
       if (out.length >= 4 || remaining <= 0) break;
+      if (wanted && !wanted.includes(path)) continue;
       if (out.some((file) => file.path === path)) continue;
       try {
         const raw = readFileSync(resolve(workspace, path), 'utf8');
@@ -261,6 +292,48 @@ export function gatherFiles(input: {
  * executor can act on in a repair round; the ones that survive the repairs become the step's
  * observation, which gives Jev a precise failure instead of a garbled tool run.
  */
+/**
+ * An edit whose old_string matches the file except for leading whitespace, or carries the line
+ * numbers of a read result, is the most common rejected call: copied from the numbered listing,
+ * its indentation is shifted. Matched line by line with indentation ignored, a unique hit is taken
+ * with the file's own text as old_string and new_string shifted by the same amount. Anything
+ * ambiguous is left for validation to reject.
+ */
+export function alignEdit(args: Record<string, unknown>, workspace: string): Record<string, unknown> {
+  const path = typeof args['path'] === 'string' ? args['path'] : undefined;
+  const absolute = path ? inside(workspace, path) : undefined;
+  if (!absolute || !existsSync(absolute) || typeof args['old_string'] !== 'string' || typeof args['new_string'] !== 'string') return args;
+  const text = readFileSync(absolute, 'utf8');
+  const unnumbered = (value: string) => {
+    const lines = value.split('\n');
+    const numbered = lines.filter((line) => line.trim()).every((line) => /^\s*\d+ {2}/.test(line));
+    return numbered ? lines.map((line) => line.replace(/^\s*\d+ {2}/, '')).join('\n') : value;
+  };
+  const oldString = unnumbered(args['old_string']);
+  const newString = unnumbered(args['new_string']);
+  if (!oldString.trim() || text.includes(args['old_string'])) return args;
+  if (text.includes(oldString)) return { ...args, old_string: oldString, new_string: newString };
+
+  const want = oldString.replace(/\n$/, '').split('\n');
+  const lines = text.split('\n');
+  const same = (a: string, b: string) => a.trim() === b.trim();
+  const hits: number[] = [];
+  for (let at = 0; at + want.length <= lines.length && hits.length < 2; at++) {
+    if (want.every((line, k) => same(line, lines[at + k]!))) hits.push(at);
+  }
+  if (hits.length !== 1) return args;
+  const actual = lines.slice(hits[0]!, hits[0]! + want.length);
+  const first = want.findIndex((line) => line.trim());
+  const indent = (line: string) => line.length - line.trimStart().length;
+  const shift = indent(actual[first]!) - indent(want[first]!);
+  const pad = actual[first]!.startsWith('\t') ? '\t' : ' ';
+  const shifted = newString
+    .split('\n')
+    .map((line) => (!line.trim() ? line : shift >= 0 ? pad.repeat(shift) + line : line.slice(Math.min(-shift, indent(line)))))
+    .join('\n');
+  return { ...args, old_string: actual.join('\n') + (oldString.endsWith('\n') ? '\n' : ''), new_string: shifted };
+}
+
 export function validateArgs(tool: ToolSpec, args: Record<string, unknown>, workspace: string): string[] {
   const problems: string[] = [];
   const properties = (tool.parameters['properties'] ?? {}) as Record<string, { type?: string }>;

@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { DEFAULT_CONFIG, type Config } from '../src/config.js';
 import { Agent } from '../src/core/agent.js';
 import { MockJevClient } from '../src/core/mock-jev.js';
-import { buildBrief, gatherFiles, validateArgs } from '../src/core/executor.js';
+import { alignEdit, buildBrief, gatherFiles, validateArgs } from '../src/core/executor.js';
 import { localImports } from '../src/core/languages.js';
 import { TOOLS_BY_NAME } from '../src/core/tools.js';
 import type { CompleteOptions, LlmClient, LlmResult } from '../src/core/llm.js';
@@ -189,9 +189,10 @@ class RamblingReporter extends ScriptedExecutor {
 }
 
 test('the reporter sees the workspace, and a cut-off draft never becomes the note', async () => {
-  const llm = new RamblingReporter([{ path: 'src/math.ts', old_string: '  return a - b;', new_string: '  return a + b;' }]);
+  const llm = new RamblingReporter([{}]);
   const dir = await workspace();
-  const jev = new MockJevClient({ tools: ['edit_file', 'read_file'] });
+  await writeFile(join(dir, 'package.json'), JSON.stringify({ scripts: { check: 'node -e "process.exit(3)"' } }));
+  const jev = new MockJevClient({ tools: ['run_shell', 'read_file'] });
   await new Agent({
     goal: 'fix the add function in src/math.ts, it subtracts',
     config: { ...DEFAULT_CONFIG, agent: { ...DEFAULT_CONFIG.agent, workspace: dir, autoApprove: true, maxSteps: 2 } },
@@ -204,7 +205,7 @@ test('the reporter sees the workspace, and a cut-off draft never becomes the not
   assert.match(llm.reporterPrompt, /Files in the workspace now: .*src\/math\.ts/);
   assert.equal(llm.reporterBudget, DEFAULT_CONFIG.llm.noteMaxTokens, 'a note never gets the executor budget');
   const notes = (jev.seenStates as Array<Record<string, unknown>>).map((state) => String(state['agent_notes'] ?? ''));
-  assert.ok(notes.some((note) => note.startsWith('edit_file succeeded')), `expected the plain fallback, got ${JSON.stringify(notes)}`);
+  assert.ok(notes.some((note) => note.startsWith('run_shell failed')), `expected the plain fallback, got ${JSON.stringify(notes)}`);
   assert.ok(!notes.some((note) => note.includes('**Analysis')), 'the cut-off draft must not reach Jev');
 });
 
@@ -217,26 +218,24 @@ test('grep with a file as its path searches that file', async () => {
   await assert.rejects(grep.execute({ pattern: 'x', path: 'src/nope.ts' }, ctx), /does not exist/);
 });
 
-/** Writes app.js, then claims criteria: once with a made-up quote, then with real ones. */
+/** Writes app.js and claims criteria in the call: once with a made-up quote, then with real ones. */
 class ProvingExecutor implements LlmClient {
   readonly label = 'proving';
-  private notes = 0;
+  private writes = 0;
   async complete(options: CompleteOptions): Promise<LlmResult> {
     const usage = { promptTokens: 0, completionTokens: 0 };
     const system = options.messages[0]?.content ?? '';
     if (/planning half/.test(system)) {
       return { content: '1. app.js saves the count in localStorage\n2. app.js ticks every second', toolCalls: [], usage, finishReason: 'stop' };
     }
-    if (/note for the decision model/.test(system)) {
-      this.notes += 1;
-      const content =
-        this.notes === 1
-          ? 'Yes: wrote app.js.\nMET 1: localStorage.setItem("count", n);\nMET 2: setInterval(tock, 5000);'
-          : 'Yes: read app.js.\nMET 2: setInterval(tick, 1000);';
-      return { content, toolCalls: [], usage, finishReason: 'stop' };
-    }
-    const args = options.tools?.[0]?.function.name === 'write_file'
-      ? { path: 'app.js', content: 'let n = 0;\nlocalStorage.setItem("count", n);\nsetInterval(tick, 1000);\n' }
+    const writing = options.tools?.[0]?.function.name === 'write_file';
+    if (writing) this.writes += 1;
+    const args = writing
+      ? {
+          path: 'app.js',
+          content: 'let n = 0;\nlocalStorage.setItem("count", n);\nsetInterval(tick, 1000);\n',
+          criteria_met: this.writes === 1 ? ['1: localStorage.setItem("count", n);', '2: setInterval(tock, 5000);'] : ['2: setInterval(tick, 1000);'],
+        }
       : { path: 'app.js' };
     return {
       content: '',
@@ -250,7 +249,7 @@ class ProvingExecutor implements LlmClient {
 test('a run ends once every criterion is proven by a quote found in the files', async () => {
   const dir = await workspace();
   const events: AgentEvent[] = [];
-  const jev = new MockJevClient({ tools: ['write_file', 'read_file', 'read_file', 'read_file', 'read_file'], leaveArgsToExecutor: true });
+  const jev = new MockJevClient({ tools: ['write_file', 'write_file', 'read_file', 'read_file', 'read_file'], leaveArgsToExecutor: true });
   const { reason, summary } = await new Agent({
     goal: 'write app.js that saves a count and ticks',
     config: { ...DEFAULT_CONFIG, agent: { ...DEFAULT_CONFIG.agent, workspace: dir, autoApprove: true, maxSteps: 6 } },
@@ -298,20 +297,18 @@ class BatchExecutor implements LlmClient {
     if (/planning half/.test(system)) {
       return { content: '1. index.html loads app.js\n2. app.js greets the user', toolCalls: [], usage, finishReason: 'stop' };
     }
-    if (/note for the decision model/.test(system)) {
-      return { content: 'Yes: wrote both.\nMET 1: <script src="app.js"></script>\nMET 2: console.log("hello there");', toolCalls: [], usage, finishReason: 'stop' };
-    }
+    if (!options.tools?.length) return { content: 'Yes.', toolCalls: [], usage, finishReason: 'stop' };
     this.toolRequests += 1;
-    const call = (id: string, path: string, content: string) => ({
+    const call = (id: string, path: string, content: string, criteria_met: string[] = []) => ({
       id,
       type: 'function' as const,
-      function: { name: 'write_file', arguments: JSON.stringify({ path, content }) },
+      function: { name: 'write_file', arguments: JSON.stringify({ path, content, criteria_met }) },
     });
     return {
       content: '',
       toolCalls: [
-        call('a', 'index.html', '<html><body><script src="app.js"></script></body></html>\n'),
-        call('b', 'app.js', 'console.log("hello there");\n'),
+        call('a', 'index.html', '<html><body><script src="app.js"></script></body></html>\n', ['1: <script src="app.js"></script>']),
+        call('b', 'app.js', 'console.log("hello there");\n', ['2: console.log("hello there");']),
         call('c', 'app.js', 'console.log("a second app.js is dropped");\n'),
       ],
       usage,
@@ -337,10 +334,10 @@ test('several write_file calls in one reply are written in one step', async () =
   const calls = events.filter((e) => e.type === 'tool-call');
   assert.deepEqual(calls.map((e) => e.type === 'tool-call' && e.args['path']), ['index.html', 'app.js'], 'the duplicate path is dropped');
   assert.equal(await readFile(join(dir, 'app.js'), 'utf8'), 'console.log("hello there");\n');
-  assert.equal(reason, 'goal-reached', 'one note proved criteria from both files');
+  assert.equal(reason, 'goal-reached', 'the calls proved criteria from both files');
 });
 
-/** Writes a broken app.js first and a working one second; every note proves both criteria. */
+/** Writes a broken app.js first and a working one second; every write claims both criteria. */
 class TestGatedExecutor implements LlmClient {
   readonly label = 'test-gated';
   writes = 0;
@@ -350,14 +347,16 @@ class TestGatedExecutor implements LlmClient {
     if (/planning half/.test(system)) {
       return { content: '1. app.js exports a tick function\n2. app.js exports ok', toolCalls: [], usage, finishReason: 'stop' };
     }
-    if (/note for the decision model/.test(system)) {
-      return { content: 'Yes.\nMET 1: export function tick()\nMET 2: export const ok =', toolCalls: [], usage, finishReason: 'stop' };
-    }
+    if (!options.tools?.length) return { content: 'Yes.', toolCalls: [], usage, finishReason: 'stop' };
     const name = options.tools?.[0]?.function.name ?? 'write_file';
     this.writes += name === 'write_file' ? 1 : 0;
     const args =
       name === 'write_file'
-        ? { path: 'app.js', content: `export function tick() {}\nexport const ok = ${this.writes > 1};\n` }
+        ? {
+            path: 'app.js',
+            content: `export function tick() {}\nexport const ok = ${this.writes > 1};\n`,
+            criteria_met: ['1: export function tick()', '2: export const ok ='],
+          }
         : { path: 'app.js' };
     return {
       content: '',
@@ -427,7 +426,7 @@ test('a cut-off reply is retried without thinking first, and only then with a bi
   const llm = new RunawayExecutor();
   await new Agent({
     goal: 'fix the add function in src/math.ts, it subtracts',
-    config: { ...DEFAULT_CONFIG, llm: { ...DEFAULT_CONFIG.llm, quickExtraBody }, agent: { ...DEFAULT_CONFIG.agent, workspace: dir, autoApprove: true, maxSteps: 1 } },
+    config: { ...DEFAULT_CONFIG, llm: { ...DEFAULT_CONFIG.llm, quickExtraBody, executorThinking: 'always' }, agent: { ...DEFAULT_CONFIG.agent, workspace: dir, autoApprove: true, maxSteps: 1 } },
     llm,
     jev: new MockJevClient({ tools: ['edit_file'] }),
     onEvent: () => {},
@@ -483,7 +482,7 @@ test('a first attempt gets a thinking allowance, and the retry without thinking 
     goal: 'fix the add function in src/math.ts, it subtracts',
     config: {
       ...DEFAULT_CONFIG,
-      llm: { ...DEFAULT_CONFIG.llm, maxTokens: 32_768, quickExtraBody },
+      llm: { ...DEFAULT_CONFIG.llm, maxTokens: 32_768, quickExtraBody, executorThinking: 'always' },
       agent: { ...DEFAULT_CONFIG.agent, workspace: dir, autoApprove: true, maxSteps: 1 },
     },
     llm,
@@ -515,4 +514,77 @@ test('criteria are planned from the files the goal names, not from the goal alon
   assert.match(llm.criteriaPrompt, /Files in the workspace: .*src\/math\.ts/);
   assert.match(llm.criteriaPrompt, /src\/math\.ts, which the goal names:/);
   assert.ok(llm.criteriaPrompt.includes(SOURCE.trimEnd()), 'the named file is shown in full');
+});
+
+test('a call whose every required argument Jev settled runs without asking the executor', async () => {
+  const dir = await workspace();
+  const llm = new ScriptedExecutor([{}]);
+  const jev = new MockJevClient({ tools: ['read_file'] });
+  await new Agent({
+    goal: 'look at src/math.ts',
+    config: { ...DEFAULT_CONFIG, agent: { ...DEFAULT_CONFIG.agent, workspace: dir, autoApprove: true, maxSteps: 1 } },
+    llm,
+    jev,
+    onEvent: () => {},
+    approve: async () => 'allow',
+  }).run();
+
+  assert.equal(llm.requests.filter((request) => request.tools?.length).length, 0, 'no executor call');
+  assert.equal(llm.requests.filter((request) => /note for the decision model/.test(request.messages[0]?.content ?? '')).length, 0, 'no note for a read');
+  assert.equal(jev.seenStates.length, 1, 'one Jev call for the step: the arguments ride with the routing question');
+});
+
+test('with executorThinking after-failure, a first attempt skips thinking and a rejected one thinks', async () => {
+  const quickExtraBody = { chat_template_kwargs: { enable_thinking: false } };
+  const dir = await workspace();
+  const llm = new ScriptedExecutor([
+    { path: 'src/math.ts', old_string: 'return a-b;', new_string: 'return a + b;' },
+    { path: 'src/math.ts', old_string: '  return a - b;', new_string: '  return a + b;' },
+  ]);
+  await new Agent({
+    goal: 'fix the add function in src/math.ts, it subtracts',
+    config: {
+      ...DEFAULT_CONFIG,
+      llm: { ...DEFAULT_CONFIG.llm, quickExtraBody, executorThinking: 'after-failure' },
+      agent: { ...DEFAULT_CONFIG.agent, workspace: dir, autoApprove: true, maxSteps: 1 },
+    },
+    llm,
+    jev: new MockJevClient({ tools: ['edit_file'] }),
+    onEvent: () => {},
+    approve: async () => 'allow',
+  }).run();
+
+  const calls = llm.requests.filter((request) => request.tools?.length);
+  assert.deepEqual(calls.map((request) => request.extraBody), [quickExtraBody, undefined]);
+  assert.equal(await readFile(join(dir, 'src', 'math.ts'), 'utf8'), SOURCE.replace('a - b', 'a + b'));
+});
+
+test('an old_string off only in indentation or copied with line numbers is aligned to the file', async () => {
+  const dir = await workspace();
+  await writeFile(join(dir, 'src', 'nest.ts'), 'function f() {\n  if (x) {\n    return 1;\n  }\n}\n');
+  const shifted = alignEdit({ path: 'src/nest.ts', old_string: 'if (x) {\n  return 1;\n}', new_string: 'if (x) {\n  return 2;\n}' }, dir);
+  assert.equal(shifted['old_string'], '  if (x) {\n    return 1;\n  }');
+  assert.equal(shifted['new_string'], '  if (x) {\n    return 2;\n  }');
+  const numbered = alignEdit({ path: 'src/nest.ts', old_string: '3      return 1;', new_string: '3      return 2;' }, dir);
+  assert.deepEqual([numbered['old_string'], numbered['new_string']], ['    return 1;', '    return 2;']);
+  const ambiguous = { path: 'src/nest.ts', old_string: '}', new_string: '};' };
+  assert.deepEqual(alignEdit(ambiguous, dir), ambiguous, 'two lines match: left for validation to reject');
+});
+
+test('an edit that meets a criterion is proven from Jev\'s pick of the lines it wrote', async () => {
+  const dir = await workspace();
+  // The executor claims nothing; the proof comes from the next routing call.
+  const llm = new ScriptedExecutor([{ path: 'src/math.ts', old_string: '  return a - b;', new_string: '  return a + b; // add, never subtract' }]);
+  const jev = new MockJevClient({ tools: ['edit_file', 'list_dir', 'list_dir'] });
+  await new Agent({
+    goal: 'fix the add function in src/math.ts, it subtracts',
+    config: { ...DEFAULT_CONFIG, agent: { ...DEFAULT_CONFIG.agent, workspace: dir, autoApprove: true, maxSteps: 3 } },
+    llm,
+    jev,
+    onEvent: () => {},
+    approve: async () => 'allow',
+  }).run();
+
+  const ledger = JSON.stringify((jev.seenStates as Array<Record<string, unknown>>).at(-1)?.['ledger'] ?? {});
+  assert.match(ledger, /"status":"met","evidence":"src\/math\.ts: return a \+ b; \/\/ add, never subtract"/);
 });

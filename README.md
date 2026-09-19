@@ -57,7 +57,8 @@ jeffrey --init                     # writes ~/.jeffrey/config.json
     "noteMaxTokens": 4096,                   // the short per-step note and the criteria
     "extraBody": {},                         // merged into every request body
     "quickExtraBody": {},                    // merged into notes, criteria and executor retries
-    "thinkingAllowance": 4096                // with quickExtraBody: a first attempt's thinking room
+    "thinkingAllowance": 2048,               // with quickExtraBody: a thinking attempt's room
+    "executorThinking": "jev"                // when the executor thinks: always | after-failure | jev
   },
   "jev": {
     "url": "https://api.typesafe.ai/v1/systemone",
@@ -80,13 +81,18 @@ A thinking model (Qwen3) thinks before every answer, and the thinking counts aga
 Give the executor room (`"maxTokens": 32768` is fine for a local model), and switch thinking off
 where it only costs time: the three-sentence note, the criteria, and executor retries (a rejected
 call is fixed mechanically; a cut-off reply is retried without thinking before its budget is doubled).
-With the setting below, a first attempt gets `thinkingAllowance` tokens of thinking room on top of
-its answer instead of the whole `maxTokens`, so a runaway is cut off in about two minutes rather
-than eight:
+With the setting below, thinking is off unless the step needs it:
 
 ```jsonc
 "quickExtraBody": { "chat_template_kwargs": { "enable_thinking": false } }
 ```
+
+Who decides, per `executorThinking`: `jev` asks the decision model whether this step takes careful
+reasoning, `after-failure` thinks only when the last step failed, `always` thinks on every first
+attempt. In every mode a rejected call is retried with thinking, and a call that only fills in a
+path, a pattern or a command never thinks. A thinking attempt gets `thinkingAllowance` tokens on top
+of an estimate of its answer, not the whole `maxTokens`, so a runaway is cut off in seconds rather
+than minutes; cut off, it is retried without thinking.
 
 Edits and writes to `.js`/`.mjs`/`.cjs`/`.json` files are parse-checked before they touch the disk.
 
@@ -164,7 +170,7 @@ than a reason to stop. When `stuck` crosses the escalation bar the loop improvis
    deliverable.
 4. Re-ask. Jev decides again, with history intact.
 
-A re-ask costs 2 Jev calls and zero steps; recoveries never consume the step budget. The ladder
+A re-ask costs one Jev call and zero steps; recoveries never consume the step budget. The ladder
 escalates on each attempt (each round withholds more, and the steering gets blunter) and is bounded
 by `--max-recoveries` (default 3, `JEFFREY_MAX_RECOVERIES`).
 
@@ -192,8 +198,8 @@ so `--json` stays line-by-line parseable.
 
 Related hardening: `done`, `ask_user` and `completed` are routed before the tool registry is
 consulted. They are pseudo-options rather than tools, so they can never be mistaken for an unknown
-tool name; a genuinely hallucinated tool name is corrected by substituting Jev's `fallback_action`
-runner-up, and the state says so on the next pass.
+tool name; a genuinely hallucinated tool name is corrected by substituting the
+runner-up in Jev's own answer, and the state says so on the next pass.
 
 ## Offline mode
 
@@ -247,20 +253,24 @@ jeffrey --jev-mock --llm-mock --print --yes "add a farewell helper"
 
 ## How a step is decided
 
-Each step the decider asks Jev a batch of questions in one request:
+Each step is one Jev request. The questions are answered independently and in parallel, so asking
+more of them costs little; asking them in a second request would cost the whole state again:
 
 | Question id | Type | Purpose |
 | --- | --- | --- |
-| `next_action` | choice | Which tool to run next (or `done` / `ask_user`) |
-| `fallback_action` | choice | Second choice if the first turns out unusable |
-| `relevant.<tool>` | noul | Probability each tool is relevant, used to keep the shortlist small |
+| `next_action` | choice | Which tool to run next (or `done` / `ask_user`). Its runner-up is the fallback |
 | `goal_reached` | noul | Is the goal satisfied? |
-| `criterion.<n>` | noul | Is acceptance criterion *n* met, on the evidence so far? |
+| `criterion.<n>` | noul | Is acceptance criterion *n* met, on the evidence so far? Skipped once proven |
+| `proof.<n>` | choice | Which line the last step wrote shows criterion *n* holds |
 | `progress` | score | 0 to 4: how much has actually been established |
 | `stuck` | noul | The agent is looping; escalate |
-| `needs_user` | noul | Requires human input; stop and ask |
-| `risk` | score | 0 to 4: how hard is this to reverse |
-| `<tool>.<arg>` | choice / noul | Which value for an argument with a closed set |
+| `step_intent` | choice | What the next action is for: locate, inspect, change, verify, repair |
+| `target_path`, `target_command` | choice | The file or command the next action works on |
+| `needs_thinking` | noul | Does this step take careful reasoning? (`executorThinking: "jev"`) |
+| `risk` | score | 0 to 4: how hard is this to reverse. Only when approvals are on |
+
+When Jev settles every argument a call needs, the call runs without asking the executor at all: a
+`read_file` of a file Jev picked, or the project's test command.
 
 `Agent.run()` converts those into one of six routes (`goal-reached`, `jev-finish`, `act`,
 `act-low-confidence`, `ask-user`, `stuck-escalation`), and only `act` reaches tool execution.
@@ -281,15 +291,23 @@ executor's brief on every step:
   failure is counted.
 - Facts. The reporter can end its note with up to two `FACT:` lines. They are kept for the rest
   of the run and flagged when their file changes afterwards.
-- Evidence. After a step that wrote or read a file, the reporter sees the file and the open
-  criteria, and adds a `MET <id>: <quote>` line for each one the file proves. The agent checks that the
-  quote is really in the file (whitespace-insensitive; `...` elisions must match in order) and, when
-  the criterion names files, that it is one of them. A proven criterion stays met whatever Jev scores,
-  and is re-checked every step. When all are proven, the run ends as `goal-reached` without asking
-  Jev again. Jev never sees the files whole, so it could not see what proves them.
+- Evidence. A criterion is proven by a line in a file. Three things can claim one: the change
+  itself (a `criteria_met` argument the executor may fill in), the note after the change (a
+  `MET <id>: <quote>` line), and Jev, which is asked on the next step which of the lines just written
+  shows the criterion holds. Every claim is checked the same way: the quote has to be in the file
+  (whitespace-insensitive; `...` elisions must match in order) and, when the criterion names files, it
+  has to be one of them. A proven criterion stays met whatever Jev scores, and is re-checked every
+  step. When all are proven, the run ends as `goal-reached` without asking Jev again.
 
 A `write_file` reply may carry several calls (one per new file). They are written in the same step,
-and one note covers them, so a small app is usually one executor call and one note.
+so a small app is usually one executor call.
+
+### What costs a model call
+
+A read, a search or a command Jev has fully specified costs no executor call, and only a failed
+command is read back by a model. A change costs one executor call and one short note, and that note
+sees the diff rather than the file. What an edit changed is in the history as a compact diff, so the
+next step and Jev can both see it without re-reading the file.
 
 ### Benchmark
 

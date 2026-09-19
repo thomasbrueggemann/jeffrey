@@ -95,6 +95,9 @@ function meter(text, streaming) {
   return {
     promptTokens: usage?.prompt_tokens ?? 0,
     completionTokens: usage?.completion_tokens ?? 0,
+    // Prompt tokens the server served from its prefix cache: already processed, so cheaper to bill
+    // and near-free in time. Zero when the server does not report it.
+    cachedTokens: usage?.prompt_tokens_details?.cached_tokens ?? 0,
     finish: finish ?? null,
     metered: Boolean(usage),
   };

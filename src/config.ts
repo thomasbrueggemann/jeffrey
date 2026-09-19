@@ -29,6 +29,14 @@ export interface LlmConfig {
    * call is retried without thinking at full budget — which in the benchmark then succeeded.
    */
   thinkingAllowance: number;
+  /**
+   * When the executor thinks, with `quickExtraBody` set. `always`: every first attempt thinks.
+   * `after-failure`: a first attempt skips thinking unless the last step failed or Jev calls the step
+   * a repair, and a rejected quick attempt is retried with thinking. `jev`: Jev answers whether the
+   * step needs careful reasoning, with the same retry. Thinking is most of the
+   * executor's time, and most calls (the plain edit the brief already spells out) do not need it.
+   */
+  executorThinking: 'always' | 'after-failure' | 'jev';
   /** Extra headers, e.g. for a gateway that needs routing metadata. */
   headers: Record<string, string>;
   /** Milliseconds before an LLM request is aborted. */
@@ -113,7 +121,8 @@ export const DEFAULT_CONFIG: Config = {
     temperature: 0.1,
     maxTokens: 4096,
     noteMaxTokens: 4096,
-    thinkingAllowance: 4096,
+    thinkingAllowance: 2048,
+    executorThinking: 'jev',
     headers: {},
     timeoutMs: 300_000,
     contextChars: 24_000,
