@@ -92,7 +92,7 @@ export class TypeSafeClient implements JevClient {
   async ask(state: unknown, questions: Record<string, Question>): Promise<SystemOneResponse> {
     if (!this.config.apiKey) {
       throw new Error(
-        'No TypeSafe API key. Set TYPESAFE_API_KEY, or add jev.apiKey to jev-agent.config.json. ' +
+        'No TypeSafe API key. Set TYPESAFE_API_KEY, or add jev.apiKey to jeffrey.config.json. ' +
           'Get a key at https://console.typesafe.ai/settings/keys',
       );
     }

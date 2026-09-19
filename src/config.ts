@@ -55,7 +55,7 @@ export interface AgentConfig {
   maxObservationChars: number;
   /** Bash timeout. */
   bashTimeoutMs: number;
-  /** Persist transcripts under ~/.jev-agent/sessions. */
+  /** Persist transcripts under ~/.jeffrey/sessions. */
   saveSessions: boolean;
 }
 
@@ -103,8 +103,8 @@ export const DEFAULT_CONFIG: Config = {
 
 type DeepPartial<T> = { [K in keyof T]?: Partial<T[K]> };
 
-export const GLOBAL_CONFIG_PATH = join(homedir(), '.jev-agent', 'config.json');
-export const PROJECT_CONFIG_NAME = 'jev-agent.config.json';
+export const GLOBAL_CONFIG_PATH = join(homedir(), '.jeffrey', 'config.json');
+export const PROJECT_CONFIG_NAME = 'jeffrey.config.json';
 
 function readJson(path: string): DeepPartial<Config> | undefined {
   if (!existsSync(path)) return undefined;
@@ -133,33 +133,33 @@ function fromEnv(env: NodeJS.ProcessEnv): DeepPartial<Config> {
     return v === '1' || v === 'true' || v === 'yes' || v === 'on';
   };
 
-  const baseUrl = str(env['JEV_AGENT_LLM_BASE_URL']);
+  const baseUrl = str(env['JEFFREY_LLM_BASE_URL']);
   if (baseUrl) llm.baseUrl = baseUrl;
-  const llmKey = str(env['JEV_AGENT_LLM_API_KEY']);
+  const llmKey = str(env['JEFFREY_LLM_API_KEY']);
   if (llmKey) llm.apiKey = llmKey;
-  const llmModel = str(env['JEV_AGENT_LLM_MODEL']);
+  const llmModel = str(env['JEFFREY_LLM_MODEL']);
   if (llmModel) llm.model = llmModel;
-  const llmTemp = num(env['JEV_AGENT_LLM_TEMPERATURE']);
+  const llmTemp = num(env['JEFFREY_LLM_TEMPERATURE']);
   if (llmTemp !== undefined) llm.temperature = llmTemp;
-  const llmMax = num(env['JEV_AGENT_LLM_MAX_TOKENS']);
+  const llmMax = num(env['JEFFREY_LLM_MAX_TOKENS']);
   if (llmMax !== undefined) llm.maxTokens = llmMax;
-  const llmMock = bool(env['JEV_AGENT_LLM_MOCK']);
+  const llmMock = bool(env['JEFFREY_LLM_MOCK']);
   if (llmMock !== undefined) llm.mock = llmMock;
 
-  const jevKey = str(env['TYPESAFE_API_KEY']) ?? str(env['JEV_AGENT_JEV_API_KEY']);
+  const jevKey = str(env['TYPESAFE_API_KEY']) ?? str(env['JEFFREY_JEV_API_KEY']);
   if (jevKey) jev.apiKey = jevKey;
-  const jevUrl = str(env['JEV_AGENT_JEV_URL']);
+  const jevUrl = str(env['JEFFREY_JEV_URL']);
   if (jevUrl) jev.url = jevUrl;
-  const jevModel = str(env['JEV_AGENT_JEV_MODEL']);
+  const jevModel = str(env['JEFFREY_JEV_MODEL']);
   if (jevModel) jev.model = jevModel;
-  const jevMock = bool(env['JEV_AGENT_JEV_MOCK']);
+  const jevMock = bool(env['JEFFREY_JEV_MOCK']);
   if (jevMock !== undefined) jev.mock = jevMock;
 
-  const maxSteps = num(env['JEV_AGENT_MAX_STEPS']);
+  const maxSteps = num(env['JEFFREY_MAX_STEPS']);
   if (maxSteps !== undefined) agent.maxSteps = maxSteps;
-  const maxRecoveries = num(env['JEV_AGENT_MAX_RECOVERIES']);
+  const maxRecoveries = num(env['JEFFREY_MAX_RECOVERIES']);
   if (maxRecoveries !== undefined) agent.maxRecoveries = maxRecoveries;
-  const yolo = bool(env['JEV_AGENT_AUTO_APPROVE']);
+  const yolo = bool(env['JEFFREY_AUTO_APPROVE']);
   if (yolo !== undefined) agent.autoApprove = yolo;
 
   return { llm, jev, agent };
@@ -242,7 +242,7 @@ export function configPaths(): { global: string; project: string } {
   };
 }
 
-/** Write a starter config so `jev-agent --init` has something to point at. */
+/** Write a starter config so `jeffrey --init` has something to point at. */
 export function writeStarterConfig(path: string, config: Config): void {
   const dir = join(path, '..');
   mkdirSync(dir, { recursive: true });

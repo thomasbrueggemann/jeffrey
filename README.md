@@ -1,4 +1,4 @@
-# jev-agent
+# jeffrey
 
 A coding-agent CLI with **two models and a clear division of labour**:
 
@@ -33,7 +33,7 @@ The loop is: `Jev → tool → Jev → tool → …` until Jev scores the goal a
 ```bash
 npm install
 npm run build
-node bin/jev-agent.js --help      # or: npm link && jev-agent --help
+node bin/jeffrey.js --help      # or: npm link && jeffrey --help
 ```
 
 Requires Node >= 22 (Ink 7).
@@ -43,7 +43,7 @@ Requires Node >= 22 (Ink 7).
 Point it at your local model and give it a TypeSafe key:
 
 ```bash
-jev-agent --init                     # writes ~/.jev-agent/config.json
+jeffrey --init                     # writes ~/.jeffrey/config.json
 ```
 
 ```jsonc
@@ -66,25 +66,25 @@ jev-agent --init                     # writes ~/.jev-agent/config.json
 
 Config is layered, later wins:
 
-`defaults` → `~/.jev-agent/config.json` → `./jev-agent.config.json` → environment → CLI flags.
+`defaults` → `~/.jeffrey/config.json` → `./jeffrey.config.json` → environment → CLI flags.
 
-Environment variables: `JEV_AGENT_LLM_BASE_URL`, `JEV_AGENT_LLM_API_KEY`, `JEV_AGENT_LLM_MODEL`,
-`TYPESAFE_API_KEY` (or `JEV_AGENT_JEV_API_KEY`), `JEV_AGENT_MAX_STEPS`, `JEV_AGENT_AUTO_APPROVE`.
+Environment variables: `JEFFREY_LLM_BASE_URL`, `JEFFREY_LLM_API_KEY`, `JEFFREY_LLM_MODEL`,
+`TYPESAFE_API_KEY` (or `JEFFREY_JEV_API_KEY`), `JEFFREY_MAX_STEPS`, `JEFFREY_AUTO_APPROVE`.
 
 Check what it actually resolved to before blaming the model:
 
 ```bash
-jev-agent --show-config     # effective config, secrets redacted
-jev-agent --list-models     # System One models available to your key
+jeffrey --show-config     # effective config, secrets redacted
+jeffrey --list-models     # System One models available to your key
 ```
 
 ## Use
 
 ```bash
-jev-agent "add retry with backoff to the http client"     # TUI, runs immediately
-jev-agent                                                 # TUI, type the goal
-jev-agent --print "fix the failing test"                  # headless transcript
-cat task.txt | jev-agent --json                           # one JSON event per line
+jeffrey "add retry with backoff to the http client"     # TUI, runs immediately
+jeffrey                                                 # TUI, type the goal
+jeffrey --print "fix the failing test"                  # headless transcript
+cat task.txt | jeffrey --json                           # one JSON event per line
 ```
 
 The TUI behaves like Claude Code / opencode: frozen step history that scrolls, a live step with
@@ -114,7 +114,7 @@ Both models can be mocked, so the whole loop is testable without a key or a GPU:
 
 ```bash
 npm run selftest                                   # runs in a temp workspace
-jev-agent --jev-mock --llm-mock --print --yes "add a farewell helper"
+jeffrey --jev-mock --llm-mock --print --yes "add a farewell helper"
 ```
 
 - `--jev-mock` replaces System One with a deterministic scripted decider. Optional tool list:

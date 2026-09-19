@@ -9,8 +9,8 @@ dist/
 .env
 .env.*
 !.env.example
-jev-agent.config.json
-.jev-agent/
+jeffrey.config.json
+.jeffrey/
 *.pem
 *.key
 *.p12

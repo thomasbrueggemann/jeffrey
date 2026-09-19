@@ -28,7 +28,7 @@ export function Header({
       >
         <Text>
           <Text color={theme.accent} bold>
-            {glyph.brand} jev-agent
+            {glyph.brand} jeffrey
           </Text>
           <Text color={theme.dim}> {version}</Text>
         </Text>

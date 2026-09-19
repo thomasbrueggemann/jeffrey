@@ -1,5 +1,5 @@
 /**
- * Shared types for jev-agent.
+ * Shared types for jeffrey.
  *
  * Two models are in play, and the split is deliberate:
  *

@@ -54,22 +54,22 @@ interface Flags {
 }
 
 const HELP = `
-  jev-agent — Jev decides, a local LLM writes the code.
+  jeffrey — Jev decides, a local LLM writes the code.
 
   Usage
-    $ jev-agent [goal] [options]
+    $ jeffrey [goal] [options]
 
     Goal is optional. Without it the TUI opens and you type one; with it the run
     starts immediately. Piping stdin or passing --print runs headless.
 
   Decider (TypeSafe System One)
     --jev-url <url>          System One endpoint           [TYPESAFE_API_KEY]
-    --jev-key <key>          API key                       [JEV_AGENT_JEV_API_KEY]
+    --jev-key <key>          API key                       [JEFFREY_JEV_API_KEY]
     --jev-model <name>       Model name
     --jev-mock[=a,b,c]       Offline scripted decider, no API key needed
 
   Executor (any OpenAI-compatible server)
-    --base-url <url>         e.g. http://localhost:11434/v1  [JEV_AGENT_LLM_BASE_URL]
+    --base-url <url>         e.g. http://localhost:11434/v1  [JEFFREY_LLM_BASE_URL]
     --api-key <key>          Sentinel is fine for local servers
     --model <name>           e.g. qwen2.5-coder:7b
     --temperature <n>        Default 0.1
@@ -92,13 +92,13 @@ const HELP = `
     --json                   One JSON object per event (implies --print)
 
   Setup
-    --init                   Write a starter config to ~/.jev-agent/config.json
+    --init                   Write a starter config to ~/.jeffrey/config.json
     --show-config            Print the effective config with secrets redacted
     --list-models            List System One models available to your key
     -h, --help
     -v, --version
 
-  Config is layered: defaults < ~/.jev-agent/config.json < ./jev-agent.config.json
+  Config is layered: defaults < ~/.jeffrey/config.json < ./jeffrey.config.json
   < environment < flags. Keys: llm / jev / agent, same names as the flags.
 `;
 
