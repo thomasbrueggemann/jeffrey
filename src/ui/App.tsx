@@ -51,9 +51,12 @@ export function App(props: AppProps) {
   const goalsRef = useRef<string[]>([]);
 
   useEffect(() => {
+    // Only the spinner reads `tick`, and it only renders while a run is in flight — so an
+    // unconditional interval would re-render the whole tree ~11x/second forever at the idle prompt.
+    if (!running) return;
     const timer = setInterval(() => setTick((value) => value + 1), 90);
     return () => clearInterval(timer);
-  }, []);
+  }, [running]);
 
   useEffect(() => {
     if (!running) return;
