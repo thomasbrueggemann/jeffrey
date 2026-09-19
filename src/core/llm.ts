@@ -48,6 +48,8 @@ export interface CompleteOptions {
   /** Called with each incremental token so the TUI can render as it arrives. */
   onToken?: (token: string) => void;
   signal?: AbortSignal;
+  /** Merged into this request's body after the config's `extraBody`. */
+  extraBody?: Record<string, unknown>;
 }
 
 export interface LlmClient {
@@ -72,6 +74,7 @@ export class OpenAiCompatibleClient implements LlmClient {
   async complete(options: CompleteOptions): Promise<LlmResult> {
     const body: Record<string, unknown> = {
       ...this.config.extraBody,
+      ...options.extraBody,
       model: this.config.model,
       messages: options.messages,
       stream: true,
@@ -233,7 +236,7 @@ export class MockLlmClient implements LlmClient {
     }
     const toolName = /Call this tool now:\s*(\w+)/.exec(brief)?.[1];
     const schema = extractTrailingJson(system);
-    const workspace = users.map((m) => /^Workspace: (.*)$/m.exec(m.content ?? '')?.[1]).find(Boolean) ?? process.cwd();
+    const workspace = users.map((m) => /^Workspace: (\/.*)$/m.exec(m.content ?? '')?.[1]).find(Boolean) ?? process.cwd();
 
     if (toolName && schema) {
       const args = synthesise(schema, settledFrom(brief), toolName, workspace);

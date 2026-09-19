@@ -256,6 +256,15 @@ export function StepBlock({ view, explain }: { view: StepView; explain: boolean 
         </Box>
       ) : null}
 
+      {view.earlier?.map((call, index) => (
+        <Box key={index} flexDirection="column">
+          <ToolCallLine tool={call.tool} args={call.args} />
+          <Box paddingLeft={3}>
+            <Text color={call.ok ? theme.dim : theme.danger}>{truncate(call.summary, 120)}</Text>
+          </Box>
+        </Box>
+      ))}
+
       {view.tool ? <ToolCallLine tool={view.tool} args={view.args} fromFallback={view.fromFallback} /> : null}
 
       {view.reasoning && !view.tool ? (

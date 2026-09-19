@@ -19,6 +19,12 @@ export interface Criterion {
   p: number;
   /** The step on which it last became met. */
   metAtStep?: number;
+  /**
+   * A quote from a file on disk that proves the criterion, checked by the agent rather than taken on
+   * a model's word. Jev never sees the files whole, so without it criteria about file contents stayed
+   * open long after the code was written.
+   */
+  evidence?: { path: string; quote: string; step: number };
 }
 
 export interface Fact {
@@ -45,7 +51,7 @@ interface Failure {
 
 /** What Jev's state and the executor's brief carry. Plain data, already trimmed to budget. */
 export interface LedgerView {
-  criteria?: Array<{ id: number; text: string; status: 'met' | 'open' }>;
+  criteria?: Array<{ id: number; text: string; status: 'met' | 'open'; evidence?: string }>;
   /** The first unmet criterion — what the next steps should move. */
   focus?: string;
   steps_since_criteria_changed?: number;
@@ -105,6 +111,13 @@ export class Ledger {
     }
   }
 
+  /** Drop a failure record: for runs whose failure describes the project, not a wrong move. */
+  forgetFailure(tool: string, args: Record<string, unknown>): void {
+    const signature = `${tool}(${signatureArgs(args)})`;
+    const index = this.failures.findIndex((failure) => failure.signature === signature);
+    if (index !== -1) this.failures.splice(index, 1);
+  }
+
   /** Record facts the reporter extracted from a step. Duplicates refresh rather than repeat. */
   addFacts(step: number, texts: string[], paths: string[]): void {
     for (const raw of texts) {
@@ -128,7 +141,7 @@ export class Ledger {
       const p = answers[criterion.id];
       if (p === undefined) continue;
       criterion.p = p;
-      const met = p >= threshold;
+      const met = p >= threshold || Boolean(criterion.evidence);
       if (met === criterion.met) continue;
       criterion.met = met;
       if (met) criterion.metAtStep = step;
@@ -137,6 +150,60 @@ export class Ledger {
     }
     if (changed.length) this.criteriaChangedAt = step;
     return changed;
+  }
+
+  /** Mark a criterion met on a quote the caller has already found in `path`. */
+  prove(id: number, path: string, quote: string, step: number): boolean {
+    const criterion = this.criteria.find((c) => c.id === id);
+    if (!criterion) return false;
+    criterion.evidence = { path, quote, step };
+    if (criterion.met) return false;
+    criterion.met = true;
+    criterion.metAtStep = step;
+    this.criteriaChangedAt = step;
+    return true;
+  }
+
+  /**
+   * Drop evidence whose quote is no longer in its file: a later edit can remove the very line that
+   * proved a criterion. `read` returns the file's current text, or undefined when it is gone.
+   */
+  recheckEvidence(read: (path: string) => string | undefined, step: number, threshold: number): number[] {
+    const changed: number[] = [];
+    for (const criterion of this.criteria) {
+      const evidence = criterion.evidence;
+      if (!evidence) continue;
+      const text = read(evidence.path);
+      if (text !== undefined && containsQuote(text, evidence.quote)) continue;
+      delete criterion.evidence;
+      const met = criterion.p >= threshold;
+      if (met !== criterion.met) {
+        criterion.met = met;
+        if (!met) delete criterion.metAtStep;
+        changed.push(criterion.id);
+      }
+    }
+    if (changed.length) this.criteriaChangedAt = step;
+    return changed;
+  }
+
+  /** Whether `command` has run and passed since the last file change. */
+  passedSinceLastChange(command: string): boolean {
+    const run = this.verifications.get(command);
+    const lastMutation = Math.max(0, ...[...this.mutations.values()].flat());
+    return Boolean(run?.ok && run.step >= lastMutation);
+  }
+
+  /** Whether `command` has run since the last file change, passing or not. */
+  ranSinceLastChange(command: string): boolean {
+    const run = this.verifications.get(command);
+    const lastMutation = Math.max(0, ...[...this.mutations.values()].flat());
+    return Boolean(run && run.step >= lastMutation);
+  }
+
+  /** Every criterion is proven by a quote from the files — done, without a model's say-so. */
+  allProven(): boolean {
+    return this.criteria.length > 0 && this.criteria.every((criterion) => criterion.evidence);
   }
 
   firstOpen(): Criterion | undefined {
@@ -153,7 +220,12 @@ export class Ledger {
     const view: LedgerView = {};
 
     if (this.criteria.length) {
-      view.criteria = this.criteria.map((c) => ({ id: c.id, text: c.text, status: c.met ? 'met' : 'open' }));
+      view.criteria = this.criteria.map((c) => ({
+        id: c.id,
+        text: c.text,
+        status: c.met ? 'met' : 'open',
+        ...(c.evidence ? { evidence: `${c.evidence.path}: ${clip(c.evidence.quote, 120)}` } : {}),
+      }));
       const open = this.firstOpen();
       if (open) view.focus = `criterion ${open.id}: ${open.text}`;
       view.steps_since_criteria_changed = Math.max(0, step - 1 - this.criteriaChangedAt);
@@ -232,15 +304,52 @@ export function parseCriteria(text: string, max = 5): string[] {
 }
 
 /** Split a reporter reply into its note and its `FACT:` lines. */
-export function splitFacts(text: string, max = 2): { note: string; facts: string[] } {
+export function splitFacts(
+  text: string,
+  max = 2,
+): { note: string; facts: string[]; proofs: Array<{ id: number; quote: string }> } {
   const facts: string[] = [];
+  const proofs: Array<{ id: number; quote: string }> = [];
   const rest: string[] = [];
   for (const line of text.split('\n')) {
-    const match = /^\s*[-*]?\s*FACT:\s*(.+)$/i.exec(line);
-    if (match?.[1]) facts.push(match[1].trim());
+    const fact = /^\s*[-*]?\s*FACT:\s*(.+)$/i.exec(line);
+    const proof = /^\s*[-*]?\s*MET\s+#?(\d+)\s*:\s*(.+)$/i.exec(line);
+    if (fact?.[1]) facts.push(fact[1].trim());
+    else if (proof?.[1] && proof[2]) proofs.push({ id: Number(proof[1]), quote: unwrapQuote(proof[2]) });
     else rest.push(line);
   }
-  return { note: rest.join('\n').trim(), facts: facts.slice(0, max) };
+  return { note: rest.join('\n').trim(), facts: facts.slice(0, max), proofs };
+}
+
+/**
+ * Whether `quote` occurs in `text`, ignoring whitespace differences. Too short a quote proves
+ * nothing ("{" is in every file), so it has to carry at least a few real characters.
+ */
+export function containsQuote(text: string, quote: string): boolean {
+  // Models shorten long quotes with "..." — honest, and each fragment is still checkable: they must
+  // all occur, in order. Rejecting them cost an extra step re-reading the file for a verbatim line.
+  const fragments = quote.split(/\.\.\.|…/).map(squash).filter(Boolean);
+  if (fragments.join('').replace(/\s/g, '').length < 8) return false;
+  const haystack = squash(text);
+  let from = 0;
+  for (const fragment of fragments) {
+    const at = haystack.indexOf(fragment, from);
+    if (at === -1) return false;
+    from = at + fragment.length;
+  }
+  return true;
+}
+
+function squash(text: string): string {
+  return text.replace(/\s+/g, ' ').trim();
+}
+
+/** Models wrap quotes in backticks or quotation marks; the file does not contain those. */
+function unwrapQuote(raw: string): string {
+  let quote = raw.trim();
+  const fence = /^(`+|"|')([\s\S]*)\1$/.exec(quote);
+  if (fence?.[2]) quote = fence[2].trim();
+  return quote;
 }
 
 function signatureArgs(args: Record<string, unknown>): string {

@@ -53,7 +53,11 @@ jeffrey --init                     # writes ~/.jeffrey/config.json
     "apiKey": "not-needed",                  // sentinel is fine for local servers
     "model": "Qwen3.6-35B-A3B-oQ4-mtp",
     "temperature": 0.1,
-    "maxTokens": 4096
+    "maxTokens": 4096,                       // per executor reply; a cut-off reply retries with double, up to 65536
+    "noteMaxTokens": 4096,                   // the short per-step note and the criteria
+    "extraBody": {},                         // merged into every request body
+    "quickExtraBody": {},                    // merged into notes, criteria and executor retries
+    "thinkingAllowance": 4096                // with quickExtraBody: a first attempt's thinking room
   },
   "jev": {
     "url": "https://api.typesafe.ai/v1/systemone",
@@ -71,6 +75,26 @@ Config is layered, later wins:
 Environment variables: `JEFFREY_LLM_BASE_URL`, `JEFFREY_LLM_API_KEY`, `JEFFREY_LLM_MODEL`,
 `TYPESAFE_API_KEY` (or `JEFFREY_JEV_API_KEY`), `JEFFREY_MAX_STEPS`, `JEFFREY_MAX_RECOVERIES`,
 `JEFFREY_AUTO_APPROVE`.
+
+A thinking model (Qwen3) thinks before every answer, and the thinking counts against `maxTokens`.
+Give the executor room (`"maxTokens": 32768` is fine for a local model), and switch thinking off
+where it only costs time: the three-sentence note, the criteria, and executor retries (a rejected
+call is fixed mechanically; a cut-off reply is retried without thinking before its budget is doubled).
+With it set, a first attempt gets `thinkingAllowance` tokens to think in on top of its answer, not the
+whole `maxTokens`, so a runaway is cut off in about two minutes rather than eight. Edits and writes to
+`.js`/`.mjs`/`.cjs`/`.json` files are parse-checked before they touch the disk:
+
+```jsonc
+"quickExtraBody": { "chat_template_kwargs": { "enable_thinking": false } }
+```
+
+The workspace is always the folder `jeffrey` starts in (or `--cwd`); a global config cannot pin it.
+
+Before finishing, Jeffrey runs the project's tests (and, unattended, once before the first step). The
+command is detected — npm/pnpm/yarn/bun, cargo, go, pytest/unittest, maven, gradle, dotnet, mix, rspec,
+`make test` — or set with `"agent": { "testCommand": "…" }`, or turned off with `false`. Detection,
+parse checks and import lookup are tables in [src/core/languages.ts](src/core/languages.ts); a language
+that is not in them gets no guesses, only the language-neutral agent.
 
 Check what it actually resolved to before blaming the model:
 
@@ -246,7 +270,7 @@ Neither model remembers anything between calls, and both only see the last few s
 keeps a **ledger** ([src/core/ledger.ts](src/core/ledger.ts)) and passes it to Jev's state and the
 executor's brief on every step:
 
-- **Acceptance criteria.** Before the first step the executor turns the goal into 2–5 checkable
+- **Acceptance criteria.** Before the first step the executor turns the goal into 2–4 checkable
   criteria. Jev scores each one every step. `goal-reached` needs all of them met (at or above
   `agent.criterionMetThreshold`, default 0.6) as well as `goal_reached` and `progress`. Jev choosing
   `done` is still final. The first open criterion is shown as the `focus`.
@@ -254,6 +278,30 @@ executor's brief on every step:
   A command's result is flagged once files have changed since it ran, and a repeated failure is counted.
 - **Facts.** The reporter can end its note with up to two `FACT:` lines. They are kept for the rest
   of the run and flagged when their file changes afterwards.
+- **Evidence.** After a step that wrote or read a file, the reporter sees the file and the open
+  criteria, and adds a `MET <id>: <quote>` line for each one the file proves. The agent checks that the
+  quote is really in the file (whitespace-insensitive; `...` elisions must match in order) and, when
+  the criterion names files, that it is one of them. A proven criterion stays met whatever Jev scores,
+  and is re-checked every step. When all are proven, the run ends as `goal-reached` without asking
+  Jev again. Jev never sees the files whole, so it could not see what proves them.
+
+A `write_file` reply may carry several calls (one per new file). They are written in the same step,
+and one note covers them, so a small app is usually one executor call and one note.
+
+### Benchmark
+
+[bench/](bench) runs a suite of tasks (a greenfield app, a bug fix, two features in existing projects)
+through Jeffrey and through [OpenCode](https://opencode.ai) on the same local model, and scores each run
+with hidden tests the agents never see. Tokens are metered at the model server, so both are counted the
+same way, thinking included.
+
+```bash
+node bench/compare.mjs --verify              # the tasks' hidden tests fail on the seed, pass on the reference
+node bench/compare.mjs --runs 2              # every task, both agents
+```
+
+Method, metrics and caveats: [bench/README.md](bench/README.md). Results:
+[bench/RESULTS.md](bench/RESULTS.md).
 
 ## Layout
 

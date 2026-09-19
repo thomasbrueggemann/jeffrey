@@ -1,13 +1,14 @@
 import { readFile, readdir } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
-import { join, relative } from 'node:path';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve } from 'node:path';
 import type { AgentEvent, ApprovalChoice, ApprovalRequest, ApprovalResponse, Budget, DoneReason, JevDecision, StepRecord } from '../types.js';
 import type { Config } from '../config.js';
 import type { LlmClient, LlmMessage } from './llm.js';
-import { Decider, ASK_USER_OPTION, FINISH_OPTION, type DeciderContext, type HistoryEntry } from './decider.js';
+import { Decider, ASK_USER_OPTION, EXECUTOR_DECIDES, FINISH_OPTION, type DeciderContext, type HistoryEntry } from './decider.js';
 import { ACTION_TOOLS, TOOLS_BY_NAME, type ToolContext, type ToolResult, type ToolSpec } from './tools.js';
 import type { JevClient } from './jev.js';
-import { Ledger, parseCriteria, splitFacts } from './ledger.js';
+import { Ledger, containsQuote, parseCriteria, splitFacts } from './ledger.js';
+import { detectTestCommand } from './languages.js';
 import {
   CRITERIA_SYSTEM,
   REPORTER_SYSTEM,
@@ -56,6 +57,35 @@ const MAX_ARG_REPAIRS = 2;
  * So each truncated call doubles the budget, up to this ceiling.
  */
 const MAX_TOKENS_CEILING = 65_536;
+const MUTATING_TOOLS = new Set(['write_file', 'edit_file', 'run_shell']);
+
+/** Whether the goal mentions `path` by its path or, for a distinctive name, by its file name. */
+function goalNames(goal: string, path: string): boolean {
+  const name = path.split('/').pop()!;
+  // Split the goal into path-like words, trimming quotes and punctuation around each.
+  const words = new Set(goal.split(/[\s"'`(),;:]+/).map((word) => word.replace(/^\.\//, '').replace(/[.]+$/, '')));
+  return words.has(path) || (name.includes('.') && words.has(name));
+}
+
+/**
+ * Roughly how many tokens a call's answer itself needs: a whole file for write_file (the current
+ * one's size, or room for a few new ones), an excerpt for edit_file, a line for the rest.
+ */
+function answerEstimate(tool: ToolSpec, files: FileContext[]): number {
+  if (tool.name === 'write_file') {
+    const current = files.find((file) => file.exists && !file.importedBy);
+    return current ? 2048 + Math.ceil(current.content.length / 3) : 8192;
+  }
+  if (tool.name === 'edit_file') return 3072;
+  return 1024;
+}
+
+function normalisePath(path: string): string {
+  return path.replace(/^\.\//, '').replace(/\\/g, '/');
+}
+
+/** Tools after which the file they touched is shown to the reporter to prove criteria against. */
+const PROVING_TOOLS = new Set(['write_file', 'edit_file', 'read_file']);
 
 /**
  * Approvals are usually a bare choice, but a question's approval carries the user's typed answer
@@ -130,6 +160,8 @@ export class Agent {
   private toolCorrections = 0;
   /** Whether the loop has already been handed to the user with a concrete question. */
   private handedOff = false;
+  /** Whether a "done" with open criteria has already been sent back once. */
+  private finishChallenged = false;
   private readonly decider: Decider;
 
   constructor(private readonly options: AgentOptions) {
@@ -195,12 +227,51 @@ export class Agent {
     this.ledger.setCriteria(await this.planCriteria());
     this.emitCriteria(0, []);
 
+    // Where the project's tests stand, before any change: a command, not a model call. A bug fix's
+    // first move was always to run them — two model calls and a note for a fact the agent can get
+    // itself. Only unattended, so an interactive run does not open with an approval prompt.
+    const baseline = config.agent.autoApprove ? this.testCommand() : undefined;
+    if (baseline) {
+      const verdict = await this.runTests(0, baseline, toolCtx);
+      this.notes =
+        verdict === 'passed'
+          ? `Before any change, \`${baseline}\` passes.`
+          : `Before any change, \`${baseline}\` fails. Its output is step 0 of the history.`;
+    }
+
     for (let step = 1; step <= config.agent.maxSteps; step++) {
       if (signal?.aborted) {
         return { reason: 'aborted', summary: 'Stopped by the user.' };
       }
 
       this.budget.steps = step;
+
+      // A later edit can delete the line that proved a criterion, so evidence is re-read every step.
+      const lost = this.ledger.recheckEvidence((path) => this.readWorkspaceFile(path), step, config.agent.criterionMetThreshold);
+      if (lost.length) this.emitCriteria(step, lost);
+      // The criteria define done. Once each is proven by a quote found in the files, asking Jev again
+      // only buys more re-reading: it never sees the files whole, so it cannot see what proves them.
+      // But a quote proves the code is there, not that it works: a project with a test command has to
+      // pass it after the last change. The agent runs it itself — a command, not a model call.
+      if (this.ledger.criteria.length >= 2 && this.ledger.allProven()) {
+        const proven = `All ${this.ledger.criteria.length} acceptance criteria are proven by quotes from the files`;
+        const tests = this.testCommand();
+        if (!tests || this.ledger.passedSinceLastChange(tests)) {
+          return { reason: 'goal-reached', summary: tests ? `${proven}, and \`${tests}\` passes.` : `${proven}.` };
+        }
+        if (!this.ledger.ranSinceLastChange(tests)) {
+          const verdict = await this.runTests(step, tests, toolCtx);
+          if (verdict === 'denied') {
+            return { reason: 'goal-reached', summary: `${proven}; running \`${tests}\` was declined, so it is untested.` };
+          }
+          if (verdict === 'passed') {
+            return { reason: 'goal-reached', summary: `${proven}, and \`${tests}\` passes.` };
+          }
+          // Failed: the output is this step's observation, and Jev repairs from it next step.
+          continue;
+        }
+      }
+
       onEvent({ type: 'phase', phase: 'deciding' });
 
       const first = await this.ask(step);
@@ -233,6 +304,7 @@ export class Agent {
       // genuinely terminal verdict leaves the loop below.
       let tool: ToolSpec | undefined;
       const recoveriesAtStepStart = this.recoveries;
+      let rereadSteered = false;
       for (let round = 0; !tool; round++) {
         if (round > MAX_ROUNDS_PER_STEP) {
           const summary = `Gave up resolving step ${step} after ${MAX_ROUNDS_PER_STEP} attempts (last route: ${decision.route}).`;
@@ -249,6 +321,26 @@ export class Agent {
         }
 
         if (decision.route === 'jev-finish') {
+          // "done" with a criterion still open: say which, once, and ask again. The criteria are the
+          // definition of done — a bug fix stopped when the visible tests passed, with the documented
+          // rule its own criteria named still unfixed. Only once: a model that insists is not
+          // overruled all the way to the step limit.
+          const open = this.ledger.criteria.filter((criterion) => !criterion.met);
+          if (open.length && !this.finishChallenged && this.ledger.criteria.length >= 2) {
+            this.finishChallenged = true;
+            onEvent({
+              type: 'notice',
+              level: 'info',
+              message: `Jev chose "done" with ${open.length} criterion${open.length === 1 ? '' : 'a'} still open (${open.map((c) => c.id).join(', ')}) — asking once more.`,
+            });
+            this.steering = [
+              ...this.steering,
+              `You chose done, but these acceptance criteria are not shown to be met yet:\n${open.map((c) => `  ${c.id}. ${c.text}`).join('\n')}\nWork on them, or choose done again if they really are satisfied.`,
+            ];
+            const failure = await reask();
+            if (failure) return failure;
+            continue;
+          }
           if (decision.goalReached < LOW_FINISH_GOAL_SCORE) {
             onEvent({
               type: 'notice',
@@ -344,6 +436,23 @@ export class Agent {
         }
 
         // --- the action ---------------------------------------------------------------------
+        // Reading a file that was already read and has not changed since shows nothing new, yet Jev
+        // asked for exactly that three times running in a live run. Re-ask with read_file withheld
+        // for this one decision: it costs a Jev call instead of an executor call, a step and a note.
+        const reread = decision.tool === 'read_file' ? this.unchangedRead(argChoices['read_file.path']) : undefined;
+        if (reread && !rereadSteered) {
+          rereadSteered = true;
+          onEvent({ type: 'notice', level: 'info', message: `Skipped re-reading ${reread.path}: read at step ${reread.step} and unchanged since.` });
+          this.steering = [
+            ...this.steering,
+            `${reread.path} was read at step ${reread.step} and has not changed since; reading it again shows nothing new. Its contents are in the history and the notes. Act on it.`,
+          ];
+          this.excludedTools.add('read_file');
+          const failure = await reask();
+          this.excludedTools.delete('read_file');
+          if (failure) return failure;
+          continue;
+        }
         tool = TOOLS_BY_NAME.get(decision.tool);
         if (tool) break;
 
@@ -398,9 +507,11 @@ export class Agent {
 
       onEvent({ type: 'phase', phase: 'planning' });
       let args: Record<string, unknown>;
+      let extra: Array<Record<string, unknown>> = [];
       try {
         const planned = await this.planArguments(tool, decision, { argChoices, argOmitted, intent, steering });
         args = planned.args;
+        extra = planned.extra;
         if (planned.problems.length) {
           // A call that is known to fail is not run: Jev gets the precise reason instead of a
           // garbled tool error, and a write_file full of "..." never reaches the disk.
@@ -417,88 +528,101 @@ export class Agent {
         continue;
       }
 
-      // --- approval -------------------------------------------------------------------------
-      const preview = await this.preview(tool, args, toolCtx);
-      const needsApproval =
-        tool.mutates &&
-        !config.agent.autoApprove &&
-        !this.allowAlways.has(tool.name) &&
-        decision.risk >= 0.5;
+      // --- approval and execution ---------------------------------------------------------------
+      // Usually one call. A batchable tool may bring more from the same reply (a new app's files); each
+      // is approved and run on its own, and one note covers them all.
+      const ran: Array<{ args: Record<string, unknown>; result: ToolResult; observation: string }> = [];
+      for (const callArgs of [args, ...extra]) {
+        const preview = await this.preview(tool, callArgs, toolCtx);
+        const needsApproval =
+          tool.mutates &&
+          !config.agent.autoApprove &&
+          !this.allowAlways.has(tool.name) &&
+          decision.risk >= 0.5;
 
-      if (needsApproval) {
-        const { choice } = normaliseApproval(
-          await this.options.approve({
-            tool: tool.name,
-            args,
-            preview,
-            risk: decision.risk,
-            reason: `Jev picked ${tool.name} (confidence ${decision.confidence.toFixed(2)}, risk ${decision.risk.toFixed(1)}/4).`,
-          })
-        );
-        if (choice === 'deny') {
-          this.record(step, tool.name, args, false, 'user denied this action', decision.progress);
-          onEvent({
-            type: 'observation',
-            step,
-            tool: tool.name,
-            ok: false,
-            output: 'The user denied this action. Choose a different approach or stop.',
-            summary: 'denied by user',
-          });
-          continue;
+        if (needsApproval) {
+          const { choice } = normaliseApproval(
+            await this.options.approve({
+              tool: tool.name,
+              args: callArgs,
+              preview,
+              risk: decision.risk,
+              reason: `Jev picked ${tool.name} (confidence ${decision.confidence.toFixed(2)}, risk ${decision.risk.toFixed(1)}/4).`,
+            })
+          );
+          if (choice === 'deny') {
+            this.record(step, tool.name, callArgs, false, 'user denied this action', decision.progress);
+            onEvent({
+              type: 'observation',
+              step,
+              tool: tool.name,
+              ok: false,
+              output: 'The user denied this action. Choose a different approach or stop.',
+              summary: 'denied by user',
+            });
+            break;
+          }
+          if (choice === 'allow-always') this.allowAlways.add(tool.name);
         }
-        if (choice === 'allow-always') this.allowAlways.add(tool.name);
+
+        onEvent({ type: 'phase', phase: 'executing' });
+        onEvent({
+          type: 'tool-call',
+          step,
+          tool: tool.name,
+          args: callArgs,
+          fromFallback: tool.name !== decision.tool,
+        });
+
+        let result: ToolResult;
+        try {
+          result = await tool.execute(callArgs, toolCtx);
+        } catch (error) {
+          result = { ok: false, output: `Error: ${(error as Error).message}`, summary: `failed: ${tool.name}` };
+        }
+
+        const observation = clamp(result.output, config.agent.maxObservationChars);
+        // Otherwise a file written this step is missing from workspace_files for up to three steps.
+        if (tool.mutates) this.fileCacheStep = -1;
+        this.record(step, tool.name, callArgs, result.ok, observation, decision.progress);
+        this.steps.push({
+          step,
+          decision,
+          tool: tool.name,
+          args: callArgs,
+          ok: result.ok,
+          observation,
+        });
+
+        onEvent({
+          type: 'observation',
+          step,
+          tool: tool.name,
+          ok: result.ok,
+          output: observation,
+          summary: result.summary,
+          diff: result.diff,
+        });
+        ran.push({ args: callArgs, result, observation });
       }
-
-      // --- execution ------------------------------------------------------------------------
-      onEvent({ type: 'phase', phase: 'executing' });
-      onEvent({
-        type: 'tool-call',
-        step,
-        tool: tool.name,
-        args,
-        fromFallback: tool.name !== decision.tool,
-      });
-
-      let result: ToolResult;
-      try {
-        result = await tool.execute(args, toolCtx);
-      } catch (error) {
-        result = { ok: false, output: `Error: ${(error as Error).message}`, summary: `failed: ${tool.name}` };
-      }
-
-      const observation = clamp(result.output, config.agent.maxObservationChars);
-      // Otherwise a file written this step is missing from workspace_files for up to three steps.
-      if (tool.mutates) this.fileCacheStep = -1;
-      this.record(step, tool.name, args, result.ok, observation, decision.progress);
-      this.steps.push({
-        step,
-        decision,
-        tool: tool.name,
-        args,
-        ok: result.ok,
-        observation,
-      });
-
-      onEvent({
-        type: 'observation',
-        step,
-        tool: tool.name,
-        ok: result.ok,
-        output: observation,
-        summary: result.summary,
-        diff: result.diff,
-      });
+      // Denied before anything ran: the step is recorded, there is nothing to narrate.
+      if (!ran.length) continue;
 
       // --- narration ------------------------------------------------------------------------
       if (this.options.narrate !== false) {
         onEvent({ type: 'phase', phase: 'verifying' });
-        const { note, facts } = splitFacts(await this.narrate(tool, args, observation, result, intent));
-        this.notes = note || `${tool.name} → ${result.summary}`;
-        const path = typeof args['path'] === 'string' ? [args['path']] : [];
-        this.ledger.addFacts(step, facts, path);
+        const proving = ran
+          .filter((call) => call.result.ok && PROVING_TOOLS.has(tool.name) && typeof call.args['path'] === 'string')
+          .map((call) => ({ path: String(call.args['path']), content: this.readWorkspaceFile(String(call.args['path'])) }))
+          .filter((file): file is { path: string; content: string } => file.content !== undefined);
+        const { note, facts, proofs } = splitFacts(await this.narrate(tool, ran, intent, proving));
+        const summary = ran.map((call) => call.result.summary).join('; ');
+        this.notes = note || `${tool.name} → ${summary}`;
+        const paths = ran.map((call) => call.args['path']).filter((p): p is string => typeof p === 'string');
+        this.ledger.addFacts(step, facts, paths);
+        if (proving.length) this.acceptProofs(step, proving, proofs);
       } else {
-        this.notes = `${tool.name} → ${result.summary}`;
+        this.notes = `${tool.name} → ${ran.map((call) => call.result.summary).join('; ')}`;
       }
     }
 
@@ -691,7 +815,7 @@ export class Agent {
       intent: string | undefined;
       steering: string[];
     },
-  ): Promise<{ args: Record<string, unknown>; problems: string[] }> {
+  ): Promise<{ args: Record<string, unknown>; problems: string[]; extra: Array<Record<string, unknown>> }> {
     const { config, goal } = this.options;
     const { workspace } = config.agent;
     const settled: Record<string, string> = {};
@@ -716,7 +840,15 @@ export class Agent {
     const forced = (this.options.toolMode ?? 'forced') === 'forced';
     let args: Record<string, unknown> = {};
     let problems: string[] = [];
-    let maxTokens = config.llm.maxTokens;
+    let more: Array<Record<string, unknown>> = [];
+    // Retries skip thinking when the config says how: fixing a rejected call is mechanical, and a
+    // reply cut off by runaway thinking is not cured by a bigger budget to think in. With that retry
+    // available, the first attempt only gets room for its answer plus a thinking allowance.
+    const quickBody = config.llm.quickExtraBody;
+    let quick = false;
+    let maxTokens = quickBody
+      ? Math.min(config.llm.maxTokens, config.llm.thinkingAllowance + answerEstimate(tool, files))
+      : config.llm.maxTokens;
 
     for (let attempt = 0; attempt <= MAX_ARG_REPAIRS; attempt++) {
       const messages: LlmMessage[] = [
@@ -743,9 +875,10 @@ export class Agent {
 
       let parsed: Record<string, unknown> | undefined;
       let truncated = false;
-      if (forced) ({ parsed, truncated } = await this.llmCall(messages, tool, 'forced', maxTokens));
+      const extraBody = quick ? quickBody : undefined;
+      if (forced) ({ parsed, truncated, more } = await this.llmCall(messages, tool, 'forced', maxTokens, extraBody));
       // The JSON fallback would be cut off at the same budget; go straight to a bigger one instead.
-      if (!parsed && !truncated) ({ parsed, truncated } = await this.llmCall(messages, tool, 'prompt', maxTokens));
+      if (!parsed && !truncated) ({ parsed, truncated } = await this.llmCall(messages, tool, 'prompt', maxTokens, extraBody));
 
       args = schemaKeys(tool, parsed ?? {});
       for (const [key, value] of Object.entries(settled)) {
@@ -762,11 +895,16 @@ export class Agent {
       }
       if (!problems.length) break;
       if (attempt === MAX_ARG_REPAIRS) break;
-      if (truncated) {
+      if (truncated && (quick || !quickBody)) {
+        // Cut off even without thinking: the answer itself is long, so it needs the room.
         if (maxTokens >= MAX_TOKENS_CEILING) break;
         maxTokens = Math.min(maxTokens * 2, MAX_TOKENS_CEILING);
         problems = [...problems, `Your token budget is now ${maxTokens}. Keep the reply to the tool call alone.`];
+      } else if (truncated) {
+        // The capped first attempt ran out while thinking; without thinking it gets the full budget.
+        maxTokens = config.llm.maxTokens;
       }
+      quick = Boolean(quickBody);
 
       this.options.onEvent({
         type: 'notice',
@@ -780,7 +918,33 @@ export class Agent {
         this.announceContext(files, jev.intent);
       }
     }
-    return { args, problems };
+    const relativise = (call: Record<string, unknown>) => {
+      // Models like absolute paths. Inside the workspace they are the same file, and a relative one is
+      // ~100 characters shorter everywhere it is repeated: Jev's history, the ledger, the evidence.
+      for (const key of tool.pathArgs ?? []) {
+        const value = call[key];
+        if (typeof value !== 'string' || !isAbsolute(value)) continue;
+        const rel = relative(workspace, value);
+        if (rel && !rel.startsWith('..') && !isAbsolute(rel)) call[key] = rel;
+      }
+      return call;
+    };
+    relativise(args);
+
+    // Further calls in the same reply: kept only when each one is valid on its own and targets a file
+    // of its own. Anything doubtful is dropped rather than repaired — the main call is the step.
+    const extra: Array<Record<string, unknown>> = [];
+    if (tool.batchable && !problems.length) {
+      const seen = new Set([String(args['path'] ?? '')]);
+      for (const raw of more) {
+        const call = relativise(schemaKeys(tool, raw));
+        const path = String(call['path'] ?? '');
+        if (!path || seen.has(path) || validateArgs(tool, call, workspace).length) continue;
+        seen.add(path);
+        extra.push(call);
+      }
+    }
+    return { args, problems, extra };
   }
 
   private announceContext(files: FileContext[], intent: string | undefined): void {
@@ -797,7 +961,8 @@ export class Agent {
     tool: ToolSpec,
     mode: ToolMode,
     maxTokens: number,
-  ): Promise<{ parsed: Record<string, unknown> | undefined; truncated: boolean }> {
+    extraBody?: Record<string, unknown>,
+  ): Promise<{ parsed: Record<string, unknown> | undefined; truncated: boolean; more: Array<Record<string, unknown>> }> {
     let buffer = '';
     const onToken = (token: string) => {
       buffer += token;
@@ -815,6 +980,7 @@ export class Agent {
             tools: [spec],
             toolChoice: 'required',
             maxTokens,
+            ...(extraBody ? { extraBody } : {}),
             onToken,
             signal: this.options.signal,
           })
@@ -829,6 +995,7 @@ export class Agent {
               },
             ],
             maxTokens,
+            ...(extraBody ? { extraBody } : {}),
             onToken,
             signal: this.options.signal,
           });
@@ -842,49 +1009,72 @@ export class Agent {
     const call = result.toolCalls.find((entry) => entry.function.name === tool.name) ?? result.toolCalls[0];
     if (call) {
       const parsed = safeJson(call.function.arguments);
-      if (parsed) return { parsed, truncated };
+      const more = result.toolCalls
+        .filter((entry) => entry !== call && entry.function.name === tool.name)
+        .map((entry) => safeJson(entry.function.arguments))
+        .filter((args): args is Record<string, unknown> => Boolean(args));
+      if (parsed) return { parsed, truncated, more };
     }
     if (mode === 'prompt') {
       const parsed = extractJsonObject(result.content);
       if (parsed) {
         const args = parsed['arguments'] ?? parsed;
-        if (typeof args === 'object' && args !== null) return { parsed: args as Record<string, unknown>, truncated };
+        if (typeof args === 'object' && args !== null) return { parsed: args as Record<string, unknown>, truncated, more: [] };
       }
     }
-    return { parsed: undefined, truncated };
+    return { parsed: undefined, truncated, more: [] };
   }
 
   private async narrate(
     tool: ToolSpec,
-    args: Record<string, unknown>,
-    observation: string,
-    result: ToolResult,
+    ran: Array<{ args: Record<string, unknown>; result: ToolResult; observation: string }>,
     intent: string | undefined,
+    files: Array<{ path: string; content: string }>,
   ): Promise<string> {
-    const ok = result.ok;
-    const fallback = `${tool.name} ${ok ? 'succeeded' : 'failed'}: ${observation.slice(0, 200)}`;
+    const ok = ran.every((call) => call.result.ok);
+    const open = files.length ? this.ledger.criteria.filter((criterion) => !criterion.evidence) : [];
+    // Split across the files so several written in one step still fit the note's budget.
+    const perFile = Math.floor(16_000 / Math.max(1, files.length));
+    const fallback = ran
+      .map((call) => `${tool.name} ${call.result.ok ? 'succeeded' : 'failed'}: ${call.observation.slice(0, 200)}`)
+      .join('\n');
     // The note says what the goal still lacks. Seeing only this one step, the reporter used to claim
     // that files written two steps earlier were still missing, and Jev went back to re-read them.
-    const files = await listWorkspaceFiles(this.options.config.agent.workspace, 200).catch(() => []);
-    const earlier = this.history.slice(-7, -1);
+    const workspaceFiles = await listWorkspaceFiles(this.options.config.agent.workspace, 200).catch(() => []);
+    const earlier = this.history.slice(-(6 + ran.length), -ran.length);
+    const names = files.map((file) => file.path).join(', ');
     const messages: LlmMessage[] = [
       { role: 'system', content: REPORTER_SYSTEM },
       {
         role: 'user',
         content: [
           `Goal: ${this.options.goal}`,
-          `Files in the workspace now: ${files.length ? files.join(', ') : '(none)'}`,
+          `Files in the workspace now: ${workspaceFiles.length ? workspaceFiles.join(', ') : '(none)'}`,
           ...(earlier.length
             ? ['Earlier steps:', ...earlier.map((entry) => `  step ${entry.step}: ${entry.tool}(${summariseArgs(entry.args)}) → ${entry.ok ? 'ok' : 'failed'}`)]
             : []),
           '',
           ...(intent ? [`Purpose of this step: ${STEP_INTENTS[intent] ?? intent}`] : []),
-          `Tool: ${tool.name}(${summariseArgs(args)})`,
-          `Result: ${ok ? 'success' : 'failure'}`,
-          '',
-          observation,
-          // An edit's output is "replaced 1 occurrence(s)"; the diff is the actual evidence.
-          ...(result.diff ? ['', 'Diff:', clamp(result.diff, 3000)] : []),
+          ...ran.flatMap((call) => [
+            `Tool: ${tool.name}(${summariseArgs(call.args)})`,
+            `Result: ${call.result.ok ? 'success' : 'failure'}`,
+            '',
+            call.observation,
+            // An edit's output is "replaced 1 occurrence(s)"; the diff is the actual evidence.
+            ...(call.result.diff && !open.length ? ['', 'Diff:', clamp(call.result.diff, 3000)] : []),
+            '',
+          ]),
+          ...(open.length
+            ? [
+                ...files.flatMap((file) => [`Current contents of ${file.path}:`, '```', clamp(file.content, perFile), '```', '']),
+                'Open acceptance criteria:',
+                ...open.map((criterion) => `  ${criterion.id}. ${criterion.text}`),
+                '',
+                `After the note, for each open criterion the contents of ${names} prove, add a line`,
+                'MET <id>: <one line copied character for character from the file above that shows it>',
+                'Check every open criterion against every file shown. Only criteria these files really prove; no line for the others.',
+              ]
+            : []),
         ].join('\n'),
       },
     ];
@@ -894,6 +1084,7 @@ export class Agent {
       const result = await this.options.llm.complete({
         messages,
         maxTokens: this.options.config.llm.noteMaxTokens,
+        ...(this.options.config.llm.quickExtraBody ? { extraBody: this.options.config.llm.quickExtraBody } : {}),
         onToken: (token) => {
           text += token;
           this.options.onEvent({ type: 'llm-stream', channel: 'narration', text });
@@ -960,9 +1151,10 @@ export class Agent {
       const result = await this.options.llm.complete({
         messages: [
           { role: 'system', content: CRITERIA_SYSTEM },
-          { role: 'user', content: `Goal: ${goal}\nWorkspace: ${this.options.config.agent.workspace}` },
+          { role: 'user', content: await this.criteriaBrief(goal) },
         ],
         maxTokens: this.options.config.llm.noteMaxTokens,
+        ...(this.options.config.llm.quickExtraBody ? { extraBody: this.options.config.llm.quickExtraBody } : {}),
         ...(this.options.signal ? { signal: this.options.signal } : {}),
       });
       this.budget.llmCalls += 1;
@@ -981,6 +1173,26 @@ export class Agent {
     return [goal];
   }
 
+  /**
+   * What the criteria are planned from: the goal, the project's files, and the ones the goal names.
+   * Planned from the goal alone, criteria on an existing project were guesses — one asked for a
+   * `calculateTotal` that never existed, and none for the rule the named file's own docs stated.
+   */
+  private async criteriaBrief(goal: string): Promise<string> {
+    const files = await listWorkspaceFiles(this.options.config.agent.workspace, 200).catch(() => [] as string[]);
+    const lines = [`Goal: ${goal}`];
+    if (!files.length) return [...lines, '', 'The workspace is empty: everything will be new.'].join('\n');
+    lines.push('', `Files in the workspace: ${files.join(', ')}`);
+    let budget = Math.floor(this.options.config.llm.contextChars / 2);
+    for (const path of files.filter((file) => goalNames(goal, file))) {
+      const content = this.readWorkspaceFile(path);
+      if (content === undefined || content.length > budget) continue;
+      budget -= content.length;
+      lines.push('', `${path}, which the goal names:`, '```', content.replace(/\n$/, ''), '```');
+    }
+    return lines.join('\n');
+  }
+
   private applyCriteria(step: number, decision: JevDecision): void {
     if (!decision.criteria) return;
     const answers: Record<number, number> = {};
@@ -994,6 +1206,107 @@ export class Agent {
         level: 'info',
         message: `Jev scored the goal as reached, but ${open ? `criterion ${open.id} (${open.text})` : 'a criterion'} is still open — continuing.`,
       });
+    }
+  }
+
+  /**
+   * Run the project's tests as a step of their own, recorded like any run_shell call so the ledger
+   * and Jev see the result. Approval follows run_shell's rules.
+   */
+  private async runTests(step: number, command: string, toolCtx: ToolContext): Promise<'passed' | 'failed' | 'denied'> {
+    const { config, onEvent } = this.options;
+    const tool = TOOLS_BY_NAME.get('run_shell')!;
+    const args = { command };
+    if (!config.agent.autoApprove && !this.allowAlways.has(tool.name)) {
+      const { choice } = normaliseApproval(
+        await this.options.approve({
+          tool: tool.name,
+          args,
+          preview: `$ ${command}`,
+          risk: 1,
+          reason: 'Every acceptance criterion is proven in the files; running the tests before finishing.',
+        }),
+      );
+      if (choice === 'deny') return 'denied';
+      if (choice === 'allow-always') this.allowAlways.add(tool.name);
+    }
+    onEvent({ type: 'phase', phase: 'executing' });
+    onEvent({ type: 'tool-call', step, tool: tool.name, args, fromFallback: false });
+    let result: ToolResult;
+    try {
+      result = await tool.execute(args, toolCtx);
+    } catch (error) {
+      result = { ok: false, output: `Error: ${(error as Error).message}`, summary: `failed: ${command}` };
+    }
+    const observation = clamp(result.output, config.agent.maxObservationChars);
+    this.record(step, tool.name, args, result.ok, observation, 0);
+    onEvent({ type: 'observation', step, tool: tool.name, ok: result.ok, output: observation, summary: result.summary });
+    this.notes = result.ok
+      ? `\`${command}\` passes.`
+      : `Every criterion's code is in the files, but \`${command}\` fails, so something is wrong. Output:\n${clamp(result.output, 1500)}`;
+    // A baseline or gate run is a fact about the project, not a failed attempt by the agent.
+    if (!result.ok) this.ledger.forgetFailure('run_shell', args);
+    return result.ok ? 'passed' : 'failed';
+  }
+
+  /** The configured test command, else the detected one; `false` in the config turns it off. */
+  private testCommand(): string | undefined {
+    const configured = this.options.config.agent.testCommand;
+    if (configured === false) return undefined;
+    return configured || detectTestCommand(this.options.config.agent.workspace);
+  }
+
+  /** The earlier read of `path`, when it succeeded and no step has changed the file since. */
+  private unchangedRead(path: string | undefined): { path: string; step: number } | undefined {
+    if (!path || path === EXECUTOR_DECIDES) return undefined;
+    const same = (other: unknown) => typeof other === 'string' && normalisePath(other) === normalisePath(path);
+    let read: HistoryEntry | undefined;
+    for (const entry of this.history) {
+      if (entry.tool === 'read_file' && entry.ok && same(entry.args['path'])) read = entry;
+      else if (read && entry.ok && MUTATING_TOOLS.has(entry.tool)) {
+        // A write to this file, or any shell command (it may have rewritten it), makes it stale.
+        if (entry.tool === 'run_shell' || same(entry.args['path'])) read = undefined;
+      }
+    }
+    return read ? { path, step: read.step } : undefined;
+  }
+
+  /** Take the reporter's MET lines only where the quote is really in the file. */
+  private acceptProofs(step: number, files: Array<{ path: string; content: string }>, proofs: Array<{ id: number; quote: string }>): void {
+    const changed: number[] = [];
+    const rejected: number[] = [];
+    for (const { id, quote } of proofs) {
+      const criterion = this.ledger.criteria.find((c) => c.id === id)?.text ?? '';
+      const existing = new Set([...this.fileCache, ...files.map((file) => file.path)].map(baseName));
+      const source = files.find((file) => namesFile(criterion, file.path, existing) && containsQuote(file.content, quote));
+      if (!source) {
+        rejected.push(id);
+        continue;
+      }
+      if (this.ledger.prove(id, source.path, quote, step)) changed.push(id);
+    }
+    if (changed.length) this.emitCriteria(step, changed);
+    // One criterion often gets several MET lines; only report those none of them proved.
+    const unproven = [...new Set(rejected)].filter((id) => !this.ledger.criteria.find((c) => c.id === id)?.evidence);
+    if (unproven.length) {
+      this.options.onEvent({
+        type: 'notice',
+        level: 'info',
+        message: `Ignored the claim that ${files.map((file) => file.path).join(', ')} proves criteria ${unproven.join(', ')}: the quote is not in the file, or the criterion is about another file.`,
+      });
+    }
+  }
+
+  private readWorkspaceFile(path: string): string | undefined {
+    const root = this.options.config.agent.workspace;
+    const absolute = resolve(root, path);
+    const rel = relative(root, absolute);
+    if (rel.startsWith('..') || isAbsolute(rel)) return undefined;
+    try {
+      if (!statSync(absolute).isFile()) return undefined;
+      return readFileSync(absolute, 'utf8');
+    } catch {
+      return undefined;
     }
   }
 
@@ -1141,4 +1454,20 @@ async function listWorkspaceFiles(root: string, limit: number): Promise<string[]
     }
   }
   return found.sort();
+}
+
+/**
+ * A criterion that names files ("app.js saves the count…") can only be proven from one of them: a real
+ * quote from style.css proves nothing about app.js. One that names no file can be proven from any.
+ */
+function namesFile(criterion: string, path: string, existing: Set<string>): boolean {
+  // Only names of files that exist count: a criterion that misnames its file ("src/todo.js" for
+  // src/todos.js) once had every correct proof rejected, and the run could never finish.
+  const named = [...criterion.matchAll(/[\w./-]+\.[A-Za-z]{1,5}\b/g)].map((m) => baseName(m[0])).filter((name) => existing.has(name));
+  if (!named.length) return true;
+  return named.includes(baseName(path));
+}
+
+function baseName(path: string): string {
+  return path.split(/[\\/]/).pop()!.toLowerCase();
 }
