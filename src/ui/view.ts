@@ -16,6 +16,8 @@ export interface StepView {
   /** The executor's short report after the tool ran. */
   narration: string;
   observation?: { ok: boolean; output: string; summary: string; diff?: string };
+  /** Calls that ran earlier in this step, when one reply brought several (e.g. a new app's files). */
+  earlier?: Array<{ tool: string; args: Record<string, unknown>; ok: boolean; summary: string }>;
 }
 
 export type Block =
@@ -100,8 +102,19 @@ export function reduce(state: ViewState, action: Action): ViewState {
 
     case 'tool-call': {
       if (!next.live) return next;
+      // A second call in the same step: keep the finished one as a line instead of overwriting it.
+      const done = next.live.tool && next.live.observation ? next.live : undefined;
       next.live = {
         ...next.live,
+        ...(done
+          ? {
+              earlier: [
+                ...(done.earlier ?? []),
+                { tool: done.tool!, args: done.args ?? {}, ok: done.observation!.ok, summary: done.observation!.summary },
+              ],
+              observation: undefined,
+            }
+          : {}),
         tool: event.tool,
         args: (event.args ?? {}) as Record<string, unknown>,
         fromFallback: event.fromFallback,

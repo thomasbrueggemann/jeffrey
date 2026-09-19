@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Ledger, describeLedger, parseCriteria, splitFacts } from '../src/core/ledger.js';
+import { Ledger, describeLedger, parseCriteria, splitFacts, containsQuote } from '../src/core/ledger.js';
 import type { HistoryEntry } from '../src/core/decider.js';
 
 const entry = (step: number, tool: string, args: Record<string, unknown>, ok = true, observation = 'ok'): HistoryEntry => ({
@@ -104,6 +104,44 @@ test('FACT lines are split out of the reporter note', () => {
   assert.deepEqual(splitFacts('Yes: the edit applied.\nFACT: add() is in src/math.ts\nfact: tests use node:test\nFACT: a third'), {
     note: 'Yes: the edit applied.',
     facts: ['add() is in src/math.ts', 'tests use node:test'],
+    proofs: [],
   });
-  assert.deepEqual(splitFacts('No change.'), { note: 'No change.', facts: [] });
+  assert.deepEqual(splitFacts('No change.'), { note: 'No change.', facts: [], proofs: [] });
+});
+
+test('MET lines become proofs, with the quote unwrapped', () => {
+  const { note, proofs } = splitFacts('Yes: wrote app.js.\nMET 2: `localStorage.setItem("sessions", n)`\nMET #3: "setInterval(tick, 1000)"');
+  assert.equal(note, 'Yes: wrote app.js.');
+  assert.deepEqual(proofs, [
+    { id: 2, quote: 'localStorage.setItem("sessions", n)' },
+    { id: 3, quote: 'setInterval(tick, 1000)' },
+  ]);
+});
+
+test('a quote proves a criterion only if it is really in the file', () => {
+  const file = 'function tick() {\n  remaining   -= 1;\n}\nlocalStorage.setItem("sessions", n);\n';
+  assert.ok(containsQuote(file, 'localStorage.setItem("sessions", n);'));
+  assert.ok(containsQuote(file, 'remaining -= 1;'), 'whitespace differences do not matter');
+  assert.ok(!containsQuote(file, 'localStorage.setItem("count", n);'));
+  assert.ok(!containsQuote(file, '{'), 'too short to prove anything');
+  assert.ok(containsQuote(file, 'function tick() { ... localStorage.setItem("sessions", n);'), 'an elided quote, fragments in order');
+  assert.ok(!containsQuote(file, 'localStorage.setItem("sessions", n); ... function tick()'), 'fragments out of order');
+  assert.ok(!containsQuote(file, 'function tick() { ... sessionStorage.clear()'), 'one fragment made up');
+});
+
+test('proven criteria survive Jev scoring them low, and fall when the quote disappears', () => {
+  const ledger = new Ledger();
+  ledger.setCriteria(['app.js saves sessions', 'app.js ticks every second']);
+  assert.ok(ledger.prove(1, 'app.js', 'localStorage.setItem("sessions", n)', 3));
+  ledger.applyCriteria({ 1: 0.1, 2: 0.1 }, 4, 0.6);
+  assert.equal(ledger.criteria[0]!.met, true, 'Jev cannot see the file; the quote outranks its score');
+  assert.equal(ledger.allProven(), false);
+
+  ledger.prove(2, 'app.js', 'setInterval(tick, 1000)', 4);
+  assert.equal(ledger.allProven(), true);
+
+  const changed = ledger.recheckEvidence(() => 'setInterval(tick, 1000)', 5, 0.6);
+  assert.deepEqual(changed, [1]);
+  assert.equal(ledger.criteria[0]!.met, false);
+  assert.equal(ledger.allProven(), false);
 });

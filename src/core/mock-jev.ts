@@ -44,6 +44,8 @@ export interface MockScript {
    * script that ends in a finished goal also ends with every criterion met.
    */
   criteriaMet?: number;
+  /** Answer every argument question with the "executor decides" escape hatch, settling nothing. */
+  leaveArgsToExecutor?: boolean;
 }
 
 export class MockJevClient implements JevClient {
@@ -151,7 +153,9 @@ export class MockJevClient implements JevClient {
     }
     if (id === 'step_intent') return intentFor(planned, step) ?? options[0] ?? '';
     // Argument questions: take the first real option, skipping the "executor decides" escape hatch.
-    const real = options.filter((option) => !option.startsWith('the executor should decide'));
+    const escape = options.find((option) => option.startsWith('the executor should decide'));
+    if (this.script.leaveArgsToExecutor && escape) return escape;
+    const real = options.filter((option) => option !== escape);
     return real[0] ?? options[0] ?? '';
   }
 }

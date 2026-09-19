@@ -35,6 +35,8 @@ export interface ToolSpec {
    * with an explicit "new path" escape hatch for creating something that does not exist yet.
    */
   pathArgs?: string[];
+  /** The executor may return several calls of this tool in one reply, all run in the same step. */
+  batchable?: boolean;
   /**
    * Arguments holding a shell command. When the workspace advertises a known set of scripts,
    * Jev gets a `choice` over them instead of leaving the command entirely to the executor.
@@ -246,7 +248,10 @@ const writeFileTool: ToolSpec = {
     'content is the complete file exactly as it should end up on disk, from the first line to the last.',
     'When the file already exists its current contents are shown: keep every part the goal does not ask to change.',
     'Never abbreviate. A comment like "// ... rest unchanged" is written to disk literally and destroys the file.',
+    'When the goal needs several files that do not exist yet, you may make one write_file call per file in this same reply, each complete, so they are written together and agree with each other.',
   ],
+  /** Several calls in one reply run in the same step: a new app's files are written in one pass. */
+  batchable: true,
   risk: 0.6,
   mutates: true,
   async execute(args, ctx) {

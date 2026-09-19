@@ -92,6 +92,8 @@ test('a loop is improvised out of rather than ending the run', async () => {
   // re-ask, because the agent withheld the tool and told it what the loop looks like.
   const result = await run({
     tools: ['read_file', 'read_file', 'read_file', 'read_file', 'read_file'],
+    // Unsettled, so the executor picks the path: a settled re-read of an unchanged file is skipped outright.
+    leaveArgsToExecutor: true,
     finalGoalReached: 0.94,
     stuck: 0.91,
     stuckFromStep: 4,
@@ -149,7 +151,7 @@ test('each round of the ladder withholds something new', async () => {
   // The tool Jev keeps re-selecting never executes, so it leaves no history entry. Ranking only on
   // what ran would withhold read_file again on every round and repeat the same improvise. Ranking
   // on re-selections too is what makes the ladder walk down the tool list instead.
-  const result = await run({ tools: Array(16).fill('read_file'), stuck: 0.91, stuckFromStep: 4 });
+  const result = await run({ tools: Array(16).fill('read_file'), stuck: 0.91, stuckFromStep: 4, leaveArgsToExecutor: true });
 
   assert.equal(result.reason, 'needs-input', `expected a hand-off, got ${result.summary}`);
 
@@ -340,9 +342,13 @@ test('Jev scores against the criteria and sees the ledger', async () => {
 test('choosing done ends the run even when the goal score is low', async () => {
   // The live failure: Jev picked `done` while its separate goal-reached score sat at 0.16–0.23.
   // Routed as a low-confidence action, `done` ran as a no-op tool and the loop kept going.
-  const result = await run({ tools: ['read_file', 'done', 'read_file', 'read_file'], goalReached: 0.1 });
+  // With criteria still open, the first `done` is sent back once; the repeated `done` is final.
+  const result = await run({ tools: ['read_file', 'done', 'done', 'read_file'], goalReached: 0.1 });
 
   assert.equal(result.reason, 'finished', `expected done to end the run: ${result.summary}`);
+  assert.ok(notices(result, 'info').some((message) => /chose "done" with .* still open .* asking once more/.test(message)));
+  const challenged = result.states.find((state) => String(state.steering ?? '').includes('You chose done, but'));
+  assert.ok(challenged, 'the open criteria reach Jev as steering');
   assert.ok(
     !result.events.some((event) => event.type === 'tool-call' && event.tool === 'done'),
     'done is a verdict, never an executed tool',
@@ -350,4 +356,17 @@ test('choosing done ends the run even when the goal score is low', async () => {
   const done = result.events.find((event): event is DoneEvent => event.type === 'done');
   assert.equal(done?.steps, 2, 'the run should stop on the step Jev chose done');
   assert.ok(notices(result, 'warn').some((message) => /goal score/.test(message)));
+});
+
+test('re-reading a file that has not changed is skipped, and Jev is told why', async () => {
+  // Jev settles read_file on the same path twice in a row; the second is never run.
+  const result = await run({ tools: ['read_file', 'read_file', 'list_dir', 'list_dir'] });
+
+  const reads = result.events.filter((event) => event.type === 'tool-call' && event.tool === 'read_file');
+  assert.equal(reads.length, 1, 'the unchanged file is read once');
+  assert.ok(notices(result, 'info').some((message) => /Skipped re-reading .* unchanged since/.test(message)));
+  const steered = result.states.find((state) => String(state.steering ?? '').includes('has not changed since'));
+  assert.ok(steered, 'the re-ask tells Jev the file is unchanged');
+  assert.ok(!offeredTools(steered!).includes('read_file'), 'and does not offer read_file on that decision');
+  assert.ok(offeredTools(result.states.at(-1)!).includes('read_file'), 'read_file comes back afterwards');
 });

@@ -1,5 +1,6 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { isAbsolute, relative, resolve } from 'node:path';
+import { localImports, syntaxProblem } from './languages.js';
 import type { HistoryEntry } from './decider.js';
 import type { ToolSpec } from './tools.js';
 import { describeLedger, type LedgerView } from './ledger.js';
@@ -54,11 +55,14 @@ export const CRITERIA_SYSTEM = `You are the planning half of a two-model coding 
 user's goal into the acceptance criteria that define "done".
 
 Rules:
-- 2 to 5 criteria, as a numbered list, one per line, nothing else.
+- 2 to 4 criteria, as a numbered list, one per line, nothing else.
 - Each one must be checkable from evidence a tool can produce: a file's contents, a command's output,
   a test result. The tools read files, search them and run shell commands — nothing can open a
-  browser or click through a UI. So state behaviour as the code that implements it ("app.js handles
-  dragstart and drop and moves the todo to the target project"), never as what a user sees.
+  browser or click through a UI. So state behaviour as the code that implements it ("the handler in
+  the routes file rejects an empty title with a 400"), never as what a user sees.
+- Each one is proven by a line that will be in a file, so name the file that will hold that line —
+  the one where that part of the work belongs, not the one the goal happens to mention first.
+- Nothing that can only be shown by an absence ("uses no framework", "makes no network requests").
 - Cover what the goal asks for and how it will be shown to work. Do not invent extra scope.
 - No preamble, no explanation.`;
 
@@ -76,6 +80,8 @@ export interface FileContext {
   content: string;
   exists: boolean;
   truncated: boolean;
+  /** Shown because this file imports it, as reference rather than as the call's target. */
+  importedBy?: string;
 }
 
 export interface BriefInput {
@@ -109,7 +115,9 @@ export function executorSystem(tool: ToolSpec, extra?: string): string {
 }
 
 export function buildBrief(input: BriefInput): string {
-  const lines = [`Goal: ${input.goal}`, `Workspace: ${input.workspace}`];
+  // No absolute workspace path: shown one, a small model writes absolute paths and garbles them
+  // (a dropped directory once sent a whole file outside the workspace, refused, and rewritten).
+  const lines = [`Goal: ${input.goal}`, 'Workspace: the current folder. Every path is relative to it, e.g. index.html or src/app.ts.'];
   if (input.intent) lines.push(`This step is for: ${STEP_INTENTS[input.intent] ?? input.intent}`);
   if (input.stage) lines.push(`Where the work stands: ${input.stage}`);
 
@@ -148,7 +156,9 @@ export function buildBrief(input: BriefInput): string {
     }
     lines.push(
       '',
-      `Current contents of ${file.path}${file.truncated ? ' (truncated)' : ''} — copy from here verbatim, no line numbers:`,
+      file.importedBy
+        ? `${file.path}, which ${file.importedBy} imports — what it offers, for reference:`
+        : `Current contents of ${file.path}${file.truncated ? ' (truncated)' : ''} — copy from here verbatim, no line numbers:`,
       fence(file.content),
     );
   }
@@ -216,12 +226,31 @@ export function gatherFiles(input: {
     try {
       if (!statSync(absolute).isFile()) continue;
       const raw = readFileSync(absolute, 'utf8');
-      if (raw.includes(' ')) continue;
+      if (raw.includes('\u0000')) continue;
       const truncated = raw.length > remaining;
       out.push({ path, content: truncated ? raw.slice(0, remaining) : raw, exists: true, truncated });
       remaining -= raw.length;
     } catch {
       // unreadable: the executor gets no contents, and validation will say why the call fails
+    }
+  }
+
+  // What the target imports from the project. A change that calls into another module has to know
+  // what that module offers: shown only server.js, the executor called a store.update() that
+  // notes.js never had, and every PATCH was a 500.
+  const target = out.find((file) => file.exists);
+  if (target) {
+    for (const path of localImports(workspace, target.path, target.content)) {
+      if (out.length >= 4 || remaining <= 0) break;
+      if (out.some((file) => file.path === path)) continue;
+      try {
+        const raw = readFileSync(resolve(workspace, path), 'utf8');
+        if (raw.includes('\u0000') || raw.length > remaining) continue;
+        out.push({ path, content: raw, exists: true, truncated: false, importedBy: target.path });
+        remaining -= raw.length;
+      } catch {
+        // unreadable import: skip it
+      }
     }
   }
   return out;
@@ -280,6 +309,10 @@ export function validateArgs(tool: ToolSpec, args: Record<string, unknown>, work
         );
       } else if (count > 1 && !replaceAll) {
         problems.push(`"old_string" occurs ${count} times in ${path}. Include enough surrounding lines to make it unique.`);
+      } else {
+        const next = replaceAll ? text.split(oldString).join(newString) : text.replace(oldString, () => newString);
+        const broken = syntaxProblem(absolute, text, next);
+        if (broken) problems.push(`The edit would leave ${path} unparseable: ${broken} Fix the edit so the file still parses.`);
       }
     }
   }
@@ -292,6 +325,11 @@ export function validateArgs(tool: ToolSpec, args: Record<string, unknown>, work
       problems.push(
         'The content contains an elision such as "... rest unchanged". write_file replaces the whole file: write every line out in full.',
       );
+    }
+    if (absolute && content.trim() && !placeholder) {
+      const before = existsSync(absolute) ? readFileSync(absolute, 'utf8') : undefined;
+      const broken = syntaxProblem(absolute, before, content);
+      if (broken) problems.push(`${path} would not parse: ${broken} Fix it and write the complete file again.`);
     }
   }
 

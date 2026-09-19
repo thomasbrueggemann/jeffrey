@@ -15,6 +15,20 @@ export interface LlmConfig {
    * seven minutes and 32k tokens. Cut off here, the note falls back to a plain result line.
    */
   noteMaxTokens: number;
+  /**
+   * Merged, after `extraBody`, into the quick calls: the per-step note, the criteria, and executor
+   * retries. A first attempt at code benefits from a thinking model's thinking; a three-sentence note
+   * or "copy old_string exactly" does not — a thinking retry of one edit once ran for eight minutes.
+   * (`noteExtraBody`, its earlier name, is still read.)
+   */
+  quickExtraBody?: Record<string, unknown>;
+  /**
+   * With `quickExtraBody` set, a first executor attempt gets this many tokens to think in, on top of
+   * an estimate of its answer, instead of the whole `maxTokens`. Successful edits used 3.5–5k in total,
+   * answer included; runaways used everything they were given (32k over eight minutes). Cut off, the
+   * call is retried without thinking at full budget — which in the benchmark then succeeded.
+   */
+  thinkingAllowance: number;
   /** Extra headers, e.g. for a gateway that needs routing metadata. */
   headers: Record<string, string>;
   /** Milliseconds before an LLM request is aborted. */
@@ -69,6 +83,12 @@ export interface AgentConfig {
   maxRecoveries: number;
   /** Skip every approval prompt. */
   autoApprove: boolean;
+  /**
+   * The project's test command, run before finishing and once before the first step (unattended).
+   * Unset: detected from the project (npm/pnpm/yarn, cargo, go, pytest, maven, gradle, dotnet, mix,
+   * rspec, `make test`). `false`: never run tests automatically.
+   */
+  testCommand?: string | false;
   /** Permit reads and writes outside the workspace root. */
   allowOutsideWorkspace: boolean;
   /** Truncate observations fed back into Jev's state. */
@@ -93,6 +113,7 @@ export const DEFAULT_CONFIG: Config = {
     temperature: 0.1,
     maxTokens: 4096,
     noteMaxTokens: 4096,
+    thinkingAllowance: 4096,
     headers: {},
     timeoutMs: 300_000,
     contextChars: 24_000,
@@ -246,6 +267,9 @@ export function loadConfig(overrides: ConfigOverrides = {}, env = process.env): 
   }
 
   merged.agent.workspace = resolve(merged.agent.workspace);
+  const legacy = (merged.llm as { noteExtraBody?: Record<string, unknown> }).noteExtraBody;
+  if (legacy && !merged.llm.quickExtraBody) merged.llm.quickExtraBody = legacy;
+  delete (merged.llm as { noteExtraBody?: unknown }).noteExtraBody;
   merged.llm.baseUrl = normalizeBaseUrl(merged.llm.baseUrl);
 
   return { config: merged, sources };
