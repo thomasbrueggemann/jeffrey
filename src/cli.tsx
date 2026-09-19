@@ -1,6 +1,7 @@
 #!/usr/bin/env node
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import process from 'node:process';
 import React from 'react';
 import { render } from 'ink';
@@ -18,10 +19,10 @@ import { TypeSafeClient, listModels, type JevClient } from './core/jev.js';
 import { MockJevClient, type MockScript } from './core/mock-jev.js';
 import { Agent, type ToolMode } from './core/agent.js';
 import { App, type Runner } from './ui/App.js';
-import type { AgentEvent, ApprovalChoice, ApprovalRequest, Budget, JevDecision } from './types.js';
+import type { AgentEvent, ApprovalRequest, ApprovalResponse, Budget, JevDecision } from './types.js';
 
 const VERSION = readVersion();
-const DEFAULT_MOCK_TOOLS = ['list_dir', 'read_file', 'write_file', 'run_shell'];
+export const DEFAULT_MOCK_TOOLS = ['list_dir', 'read_file', 'write_file', 'run_shell'];
 
 interface Flags {
   goal: string;
@@ -45,6 +46,7 @@ interface Flags {
   json: boolean;
   dryRun: boolean;
   jevMock?: string[];
+  jevMockScript?: MockScript;
   llmMock: boolean;
   init: boolean;
   showConfig: boolean;
@@ -67,6 +69,8 @@ const HELP = `
     --jev-key <key>          API key                       [JEFFREY_JEV_API_KEY]
     --jev-model <name>       Model name
     --jev-mock[=a,b,c]       Offline scripted decider, no API key needed
+    --jev-mock-script <json> Full MockScript, e.g. '{"tools":["read_file"],
+                             "stuck":0.91,"stuckFromStep":4}' to replay a loop
 
   Executor (any OpenAI-compatible server)
     --base-url <url>         e.g. http://localhost:11434/v1  [JEFFREY_LLM_BASE_URL]
@@ -231,8 +235,24 @@ export function parseArgs(argv: string[]): Flags {
         flags.llmMock = true;
         break;
       case '--jev-mock': {
-        const tools = inline === undefined && argv[i + 1] && !argv[i + 1]!.startsWith('-') ? argv[++i] : inline;
-        flags.jevMock = tools ? tools.split(',').map((name) => name.trim()).filter(Boolean) : DEFAULT_MOCK_TOOLS;
+        // Inline only, per the documented `--jev-mock[=a,b,c]`. A space-separated value would eat
+        // the goal, which reads as "no goal given" rather than as a parse error.
+        flags.jevMock = inline ? inline.split(',').map((name) => name.trim()).filter(Boolean) : DEFAULT_MOCK_TOOLS;
+        break;
+      }
+      case '--jev-mock-script': {
+        const json = inline === undefined && argv[i + 1] && !argv[i + 1]!.startsWith('-') ? argv[++i] : inline;
+        if (!json) fail('--jev-mock-script needs a JSON object');
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(json);
+        } catch (error) {
+          fail(`--jev-mock-script is not valid JSON: ${(error as Error).message}`);
+        }
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          fail('--jev-mock-script must be a JSON object, e.g. \'{"tools":["read_file"],"stuck":0.91}\'');
+        }
+        flags.jevMockScript = parsed as MockScript;
         break;
       }
       case '--init':
@@ -281,7 +301,7 @@ function jevOverrides(flags: Flags): ConfigOverrides {
   if (flags.jevUrl) jev.url = flags.jevUrl;
   if (flags.jevKey) jev.apiKey = flags.jevKey;
   if (flags.jevModel) jev.model = flags.jevModel;
-  if (flags.jevMock) jev.mock = true;
+  if (flags.jevMock || flags.jevMockScript) jev.mock = true;
   return { jev };
 }
 
@@ -314,8 +334,9 @@ export function buildSession(flags: Flags): Session {
 
   const { config } = loadConfig(overrides);
 
-  const script: MockScript = { tools: flags.jevMock ?? DEFAULT_MOCK_TOOLS };
-  const mockJev = flags.jevMock ? new MockJevClient(script) : undefined;
+  const script: MockScript = flags.jevMockScript ?? { tools: flags.jevMock ?? DEFAULT_MOCK_TOOLS };
+  const useMock = Boolean(flags.jevMockScript || flags.jevMock);
+  const mockJev = useMock ? new MockJevClient(script) : undefined;
   const jev: JevClient = mockJev ?? new TypeSafeClient(config.jev);
   const llmLabel = config.llm.mock
     ? 'mock-executor'
@@ -451,7 +472,7 @@ export function createPrinter(write = plain): {
 
 /* ------------------------------------------------------------------ entry */
 
-async function main(): Promise<void> {
+export async function main(): Promise<void> {
   const flags = parseArgs(process.argv.slice(2));
 
   if (flags.help) {
@@ -502,17 +523,25 @@ async function main(): Promise<void> {
     if (!goal) fail('no goal given. Pass one as an argument, or pipe it on stdin.');
 
     const printer = createPrinter();
-    const approve = async (request: ApprovalRequest): Promise<ApprovalChoice> => {
-      if (flags.dryRun) {
-        plain(`   approval: denied ${request.tool} (--dry-run)`);
-        return 'deny';
-      }
-      plain(`   approval: auto-allowed ${request.tool} (headless mode)`);
-      return 'allow';
-    };
-    const jsonPrinter = flags.json
+    const emit = flags.json
       ? (event: AgentEvent) => process.stdout.write(`${JSON.stringify(event)}\n`)
       : printer.onEvent;
+    const approve = async (request: ApprovalRequest): Promise<ApprovalResponse> => {
+      // Emit through the event stream so `--json` stays parseable (raw stdout writes would corrupt it)
+      // and the question is visible in both text and JSON output.
+      if (flags.dryRun) {
+        emit({ type: 'notice', level: 'warn', message: `denied ${request.tool} (--dry-run)` });
+        return 'deny';
+      }
+      if (request.question) {
+        emit({ type: 'notice', level: 'info', message: `question for you: ${request.question}` });
+      }
+      // Headless mode has no one to type an answer, so the request is surfaced and then continued on.
+      // The agent sees the continuation note rather than a fabricated answer.
+      emit({ type: 'notice', level: 'info', message: `auto-allowed ${request.tool} (headless mode)` });
+      return 'allow';
+    };
+    const jsonPrinter = emit;
 
     await runner(goal, { onEvent: jsonPrinter, approve, signal: new AbortController().signal });
     const code = flags.json ? 0 : printer.finish();
@@ -544,8 +573,25 @@ async function readStdinGoal(): Promise<string> {
   return Buffer.concat(chunks).toString('utf8').trim();
 }
 
-main().catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`error: ${message}\n`);
-  process.exit(1);
-});
+/**
+ * Only auto-run when this module *is* the entry point (e.g. `node dist/cli.js`), so tests can
+ * import `parseArgs`/`buildSession` without kicking off a session. The published `bin/jeffrey.js`
+ * is a separate file, so it calls `main()` itself rather than relying on this guard.
+ */
+const isEntryPoint = (() => {
+  const entry = process.argv[1];
+  if (!entry) return false;
+  try {
+    return realpathSync(entry) === realpathSync(fileURLToPath(import.meta.url));
+  } catch {
+    return false;
+  }
+})();
+
+if (isEntryPoint) {
+  main().catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    process.stderr.write(`error: ${message}\n`);
+    process.exit(1);
+  });
+}

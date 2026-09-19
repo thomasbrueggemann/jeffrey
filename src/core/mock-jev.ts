@@ -13,6 +13,11 @@ export interface MockScript {
   tools: string[];
   /** Probability reported for "goal reached" once the script is exhausted. */
   finalGoalReached?: number;
+  /**
+   * Probability reported for "goal reached" while the script still has tools left. Defaults to 0.04.
+   * Raise it to exercise the goal-reached route on an early step.
+   */
+  goalReached?: number;
   /** Probability reported for "stuck" from `stuckFromStep` onward. */
   stuck?: number;
   stuckFromStep?: number;
@@ -88,7 +93,7 @@ export class MockJevClient implements JevClient {
 
   private noulFor(id: string, step: number, exhausted: boolean): number {
     if (id === 'goal_reached') {
-      return exhausted ? (this.script.finalGoalReached ?? 0.94) : 0.04;
+      return exhausted ? (this.script.finalGoalReached ?? 0.94) : (this.script.goalReached ?? 0.04);
     }
     if (id === 'stuck') {
       if (this.script.stuck !== undefined && step >= (this.script.stuckFromStep ?? 0)) {

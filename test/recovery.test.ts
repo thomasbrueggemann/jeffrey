@@ -7,7 +7,7 @@ import { DEFAULT_CONFIG, type Config } from '../src/config.js';
 import { Agent } from '../src/core/agent.js';
 import { MockJevClient, type MockScript } from '../src/core/mock-jev.js';
 import { MockLlmClient } from '../src/core/llm.js';
-import type { AgentEvent, ApprovalChoice, ApprovalRequest, DoneReason } from '../src/types.js';
+import type { AgentEvent, ApprovalChoice, ApprovalRequest, ApprovalResponse, DoneReason } from '../src/types.js';
 
 /**
  * Regressions for the two ways a live run failed:
@@ -43,7 +43,7 @@ async function scratchWorkspace(): Promise<string> {
 async function run(
   script: MockScript,
   goal = 'fix the off-by-one in src/index.ts',
-  approve: ApprovalChoice = 'allow',
+  approve: ApprovalChoice | ((request: ApprovalRequest) => ApprovalResponse) = 'allow',
   agent: Partial<Config['agent']> = {},
 ): Promise<RunResult> {
   const config: Config = {
@@ -61,7 +61,7 @@ async function run(
     onEvent: (event) => events.push(event),
     approve: async (request) => {
       approvals.push(request);
-      return approve;
+      return typeof approve === 'function' ? approve(request) : approve;
     },
   });
   const { reason, summary } = await instance.run();
@@ -100,7 +100,7 @@ test('a loop is improvised out of rather than ending the run', async () => {
 
   assert.equal(result.reason, 'goal-reached', `expected recovery to continue the run: ${result.summary}`);
 
-  const diagnoses = notices(result, 'warn').filter((message) => /detected a loop/.test(message));
+  const diagnoses = notices(result, 'warn').filter((message) => /reported a loop/.test(message));
   assert.equal(diagnoses.length, 1, `expected one loop diagnosis, got ${JSON.stringify(notices(result))}`);
   assert.match(diagnoses[0]!, /read_file ran 4 of the last 4/);
 
@@ -135,8 +135,48 @@ test('a persistent loop hands off to the user instead of failing', async () => {
   assert.equal(result.reason, 'needs-input', `expected a hand-off, got ${result.summary}`);
   const handoff = result.approvals.find((request) => request.tool === 'ask_user');
   assert.ok(handoff, 'expected the loop to be handed to the user with a question');
-  assert.match(String(handoff.args.question), /widened the context/);
-  assert.match(String(handoff.args.question), /What should I do differently\?/);
+
+  // The box shows the reason above the question, so the two must not repeat each other: reason =
+  // what was tried, question = the ask. Repeating the diagnosis in both wastes the box's width.
+  assert.match(handoff.reason, /reported a loop/);
+  assert.match(handoff.reason, /widened the context/);
+  assert.equal(handoff.args.question, 'What should I do differently?');
+  assert.match(result.summary, /widened the context/);
+  assert.match(result.summary, /What should I do differently\?/);
+});
+
+test('each round of the ladder withholds something new', async () => {
+  // The tool Jev keeps re-selecting never executes, so it leaves no history entry. Ranking only on
+  // what ran would withhold read_file again on every round and repeat the same improvise. Ranking
+  // on re-selections too is what makes the ladder walk down the tool list instead.
+  const result = await run({ tools: Array(16).fill('read_file'), stuck: 0.91, stuckFromStep: 4 });
+
+  assert.equal(result.reason, 'needs-input', `expected a hand-off, got ${result.summary}`);
+
+  const rounds = result.states.map((state) => offeredTools(state)).filter((tools) => tools.length > 0);
+  const universe = rounds[0] ?? [];
+  const withheldPerRound = rounds.map((offered) => universe.filter((name) => !offered.includes(name)));
+
+  const distinct = new Set(withheldPerRound.map((names) => names.join(',')));
+  assert.ok(
+    distinct.size >= 3,
+    `expected the withheld set to change each round, got ${JSON.stringify([...distinct])}`,
+  );
+
+  // Withholding more, never swapping one tool out for another.
+  for (let i = 1; i < withheldPerRound.length; i += 1) {
+    const before = withheldPerRound[i - 1]!;
+    const after = withheldPerRound[i]!;
+    assert.ok(
+      before.every((name) => after.includes(name)),
+      `round ${i} dropped a withheld tool: ${JSON.stringify(before)} -> ${JSON.stringify(after)}`,
+    );
+  }
+
+  // The diagnosis has to name the re-selection, or the improvised attempt is a guess.
+  const diagnoses = notices(result, 'warn').filter((message) => /keeps choosing/.test(message));
+  assert.ok(diagnoses.length >= 1, `expected the diagnosis to name the re-selection, got ${JSON.stringify(notices(result))}`);
+  assert.match(diagnoses[0]!, /it keeps choosing \w+ instead of acting on it/);
 });
 
 test('ask_user is honoured even when needs_user is low', async () => {
@@ -191,11 +231,14 @@ test('exhausting tool-name corrections is a clean error', async () => {
     'expected exactly two corrections before giving up',
   );
 
-  // The correction has to name the valid moves, or the re-ask cannot fix anything.
-  const steered = result.states.filter((state) => String(state.steering ?? '').includes('not a tool'));
-  assert.equal(steered.length, 2);
-  assert.match(String(steered[0]!.steering), /read_file, write_file, edit_file/);
-  assert.match(String(steered[0]!.steering), /ask_user .*ask the user a question/);
+  // The correction has to name the valid moves, or the re-ask cannot fix anything. Each decision
+  // reaches Jev twice (routing, then arguments), so compare the distinct corrections, not states.
+  const steered = result.states
+    .map((state) => String(state.steering ?? ''))
+    .filter((steering) => steering.includes('not a tool'));
+  assert.ok(steered.length >= 2, 'the correction must reach Jev on every attempt');
+  assert.match(steered[0]!, /read_file, write_file, edit_file/);
+  assert.match(steered[0]!, /ask_user .*ask the user a question/);
 });
 
 test('maxRecoveries bounds the ladder', async () => {
@@ -208,4 +251,50 @@ test('maxRecoveries bounds the ladder', async () => {
 
   assert.equal(result.reason, 'needs-input');
   assert.equal(result.approvals.length, 1, 'one hand-off, then stop');
+});
+
+test('the answer to a question reaches Jev instead of being discarded', async () => {
+  // The hand-off asked "What should I do differently?" and the only thing the UI could send back was
+  // allow/deny — the typed answer was dropped. It must arrive as steering on the next decision.
+  const result = await run(
+    { tools: Array(16).fill('read_file'), stuck: 0.91, stuckFromStep: 4 },
+    'fix the off-by-one',
+    (request) => ({ choice: 'allow', answer: 'stop reading and write the test first' }),
+  );
+
+  assert.equal(result.reason, 'needs-input');
+  assert.ok(result.approvals.length >= 1);
+  assert.ok(
+    result.approvals.every((request) => typeof request.question === 'string' && request.question.length > 0),
+    'a hand-off approval must carry the question it is asking',
+  );
+
+  const steered = result.states
+    .map((state) => String(state.steering ?? ''))
+    .filter((steering) => steering.includes('stop reading and write the test first'));
+  assert.ok(steered.length >= 1, 'the answer must reach Jev as steering');
+  assert.match(steered[0]!, /stop reading and write the test first/);
+});
+
+test('an answered question resumes the run and can reach the goal', async () => {
+  // ask_user on step 1: answering it must let the loop continue rather than dead-end, which is what
+  // "gracefully improvise" means for this route. The goal is then scored reached, so the run can only
+  // get there if the answer unblocked the next decision.
+  const result = await run(
+    { tools: ['ask_user'], goalReached: 0.9 },
+    'did you write the file?',
+    (request) => ({ choice: 'allow', answer: 'yes, write it' }),
+  );
+
+  assert.equal(result.reason, 'goal-reached');
+  assert.equal(result.approvals[0]?.tool, 'ask_user');
+  const steered = result.states.map((state) => String(state.steering ?? '')).join('\n');
+  assert.match(steered, /yes, write it/);
+});
+
+test('declining a question still stops cleanly', async () => {
+  const result = await run({ tools: ['ask_user'], goalReached: 0.9 }, 'did you write the file?', 'deny');
+
+  assert.equal(result.reason, 'aborted');
+  assert.equal(result.approvals.length, 1);
 });

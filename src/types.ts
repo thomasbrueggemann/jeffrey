@@ -132,7 +132,27 @@ export interface ApprovalRequest {
   preview?: string;
   risk: number;
   reason: string;
+  /**
+   * Set when this approval is really a question (`ask_user`, or the loop hand-off): the user's typed
+   * answer comes back as the approval's `answer` instead of a bare allow. Without this a question
+   * could only be answered "yes" or "no" and the text was thrown away.
+   */
+  question?: string;
+  /** A free-text answer, supplied only when `question` is set. */
+  answer?: string;
 }
+
+/**
+ * An approval's outcome. A plain `ApprovalChoice` is still valid — most approvals are not questions —
+ * so the richer form is only used when there is an answer to carry back.
+ */
+export interface ApprovalResult {
+  choice: ApprovalChoice;
+  /** The user's typed answer, when the request carried a `question`. */
+  answer?: string;
+}
+
+export type ApprovalResponse = ApprovalChoice | ApprovalResult;
 
 export interface Budget {
   jevCalls: number;

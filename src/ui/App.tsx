@@ -1,14 +1,14 @@
 import React, { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
 import { Box, Static, Text, useApp, useInput } from 'ink';
 import TextInput from 'ink-text-input';
-import type { AgentEvent, ApprovalChoice, ApprovalRequest } from '../types.js';
+import type { AgentEvent, ApprovalRequest, ApprovalResponse } from '../types.js';
 import { Header, ApprovalBox, StatusBar, StepBlock, renderBlock } from './components.js';
 import { initialState, reduce, type StepView } from './view.js';
 import { glyph, spinnerFrame, theme } from './theme.js';
 
 export interface RunnerOptions {
   onEvent: (event: AgentEvent) => void;
-  approve: (request: ApprovalRequest) => Promise<ApprovalChoice>;
+  approve: (request: ApprovalRequest) => Promise<ApprovalResponse>;
   signal: AbortSignal;
 }
 
@@ -47,7 +47,7 @@ export function App(props: AppProps) {
   const [elapsed, setElapsed] = useState(0);
 
   const abortRef = useRef<AbortController | null>(null);
-  const approvalResolver = useRef<((choice: ApprovalChoice) => void) | null>(null);
+  const approvalResolver = useRef<((response: ApprovalResponse) => void) | null>(null);
   const goalsRef = useRef<string[]>([]);
 
   useEffect(() => {
@@ -62,16 +62,17 @@ export function App(props: AppProps) {
     return () => clearInterval(timer);
   }, [running]);
 
-  const resolveApproval = useCallback((choice: ApprovalChoice) => {
+  const resolveApproval = useCallback((response: ApprovalResponse) => {
     const resolve = approvalResolver.current;
     approvalResolver.current = null;
     setApproval(null);
-    resolve?.(choice);
+    setInput('');
+    resolve?.(response);
   }, []);
 
   const approve = useCallback(
     (request: ApprovalRequest) =>
-      new Promise<ApprovalChoice>((resolve) => {
+      new Promise<ApprovalResponse>((resolve) => {
         approvalResolver.current = resolve;
         setApproval(request);
       }),
@@ -136,8 +137,16 @@ export function App(props: AppProps) {
     props.onExit();
   }, [abort, exit, props]);
 
+  const asking = approval?.question !== undefined;
+
   useInput(
     (char, key) => {
+      if (asking) {
+        // A question is answered with the prompt's text input, not with y/n — so no keys are claimed
+        // here and typed characters reach the input. Only the escape hatch is handled.
+        if (key.escape) resolveApproval('deny');
+        return;
+      }
       if (approval) {
         if (char === 'y' || char === 'Y' || key.return) resolveApproval('allow');
         else if (char === 'a' || char === 'A') resolveApproval('allow-always');
@@ -160,10 +169,11 @@ export function App(props: AppProps) {
 
   const live = state.live;
   const hint = useMemo(() => {
+    if (asking) return 'type your answer · enter send · esc decline';
     if (approval) return 'y allow · a always · n deny';
     if (running) return 'esc abort · ctrl-c quit';
     return 'enter run · ctrl-c quit';
-  }, [approval, running]);
+  }, [approval, asking, running]);
 
   return (
     <Box flexDirection="column">
@@ -192,7 +202,35 @@ export function App(props: AppProps) {
 
       {approval ? <ApprovalBox request={approval} /> : null}
 
-      {running ? (
+      {approval ? (
+        <Box marginTop={1} flexDirection="column">
+          <Box borderStyle="round" borderColor={theme.warn} paddingX={1} width="100%">
+            <Text color={theme.warn}>{glyph.prompt} </Text>
+            <TextInput
+              value={input}
+              onChange={setInput}
+              onSubmit={(value) => {
+                if (asking) {
+                  const answer = value.trim();
+                  // Enter on an empty answer means "no answer" — treat it as declining rather than
+                  // handing Jev a blank instruction it cannot act on.
+                  if (answer) resolveApproval({ choice: 'allow', answer });
+                  else resolveApproval('deny');
+                  return;
+                }
+                resolveApproval('allow');
+              }}
+              placeholder="answer the agent…"
+              focus
+            />
+          </Box>
+          <Box paddingX={1}>
+            <Text color={theme.dim}>{hint}</Text>
+          </Box>
+        </Box>
+      ) : null}
+
+      {running && !asking ? (
         <Box marginTop={1} flexDirection="column">
           <StatusBar
             phase={PHASE_LABEL[state.phase] ?? state.phase}
@@ -209,9 +247,17 @@ export function App(props: AppProps) {
             </Text>
           </Box>
         </Box>
-      ) : (
+      ) : null}
+
+      {approval && !asking ? (
+        <Box paddingX={1} marginTop={1}>
+          <Text color={theme.dim}>{hint}</Text>
+        </Box>
+      ) : null}
+
+      {!running && !approval ? (
         <Box marginTop={1} flexDirection="column">
-          <Box borderStyle="round" borderColor={approval ? theme.warn : theme.accent} paddingX={1} width="100%">
+          <Box borderStyle="round" borderColor={theme.accent} paddingX={1} width="100%">
             <Text color={theme.accent}>{glyph.prompt} </Text>
             <TextInput
               value={input}
@@ -225,7 +271,7 @@ export function App(props: AppProps) {
                   ? 'describe what you want the agent to do…'
                   : 'another goal — the session context carries over…'
               }
-              focus={approval === null}
+              focus
             />
           </Box>
           <Box paddingX={1} justifyContent="space-between">
@@ -235,7 +281,7 @@ export function App(props: AppProps) {
             </Text>
           </Box>
         </Box>
-      )}
+      ) : null}
     </Box>
   );
 }

@@ -60,7 +60,7 @@ jeffrey --init                     # writes ~/.jeffrey/config.json
     "apiKey": "",                            // or export TYPESAFE_API_KEY
     "model": "jev-latest"
   },
-  "agent": { "maxSteps": 24, "autoApprove": false }
+  "agent": { "maxSteps": 24, "maxRecoveries": 3, "autoApprove": false }
 }
 ```
 
@@ -69,7 +69,8 @@ Config is layered, later wins:
 `defaults` → `~/.jeffrey/config.json` → `./jeffrey.config.json` → environment → CLI flags.
 
 Environment variables: `JEFFREY_LLM_BASE_URL`, `JEFFREY_LLM_API_KEY`, `JEFFREY_LLM_MODEL`,
-`TYPESAFE_API_KEY` (or `JEFFREY_JEV_API_KEY`), `JEFFREY_MAX_STEPS`, `JEFFREY_AUTO_APPROVE`.
+`TYPESAFE_API_KEY` (or `JEFFREY_JEV_API_KEY`), `JEFFREY_MAX_STEPS`, `JEFFREY_MAX_RECOVERIES`,
+`JEFFREY_AUTO_APPROVE`.
 
 Check what it actually resolved to before blaming the model:
 
@@ -108,17 +109,86 @@ Jev chooses among them; it can also answer `done` (goal reached), `ask_user`, or
 shortlist entirely so the executor proposes the argument itself — which is how new files get
 created.
 
+## When it gets stuck
+
+Jev reports `stuck` as a probability, and the agent treats it as a signal to change strategy — not
+as a reason to die. When `stuck` crosses the escalation bar the loop **improvises**:
+
+1. **Diagnose.** The repeated tool calls, Jev's re-selections and its own `progress` / `goal_reached`
+   scores are folded into one sentence — "Jev reported a loop (stuck p=0.91) after 4 steps: read_file
+   ran 4 of the last 4, and it keeps choosing write_file instead of acting on it, while the goal score
+   stayed at 4% (progress 1.8/4)." It is deliberately compact: it is rendered inside the TUI's notice
+   box and again in the final block, and a diagnosis that gets clipped mid-sentence is worthless.
+2. **Withhold the tool.** The moves that are not working are removed from the shortlist, both from
+   the list Jev is offered and from the state description, so a confident model cannot pick them
+   again. Asking politely does not survive a confident model. Re-selecting a tool is itself a signal:
+   a tool Jev keeps choosing but never gets to run leaves no trace in the step history, so it is
+   tracked separately and withheld too — otherwise each round would withhold the same name and the
+   ladder would not move.
+3. **Escalate steering.** A directive is added to the state: avoid what already failed, try another
+   tool, and make the next call different in kind. From the second round the state also carries the
+   verbatim outcomes so far, and from the third it restates the goal and asks for the actual
+   deliverable.
+4. **Re-ask.** Jev decides again, with history intact.
+
+A re-ask costs **2 Jev calls and zero steps** — recoveries never burn your step budget. The ladder
+escalates on each attempt (each round withholds more, and the steering gets blunter) and is bounded
+by `--max-recoveries` (default 3, `JEFFREY_MAX_RECOVERIES`).
+
+If the ladder is exhausted and Jev still cannot make progress, jeffrey stops improvising and
+**hands back to you**: the approval box names what was tried and why it stalled, states the question
+on its own line ("What should I do differently?"), and the run ends with the `needs-input` outcome
+(`◐ needs your input`, amber — a pause, not a failure) and exit code 1. A question Jev asks
+explicitly via `ask_user` ends the same way, so "needs a human" never looks like "crashed".
+
+### Answering a question
+
+When Jev asks, the approval box switches to a question prompt: the argument preview is hidden, the
+title reads "the agent is asking you a question", and a text field replaces the status bar.
+
+- **Type your answer and press enter.** It is handed back to Jev as steering — quoted in the next
+  state, recorded in the run notes, and re-decided immediately. The answer steers *the step it was
+  given for*, so it is applied after the recovery plan rather than being overwritten by it.
+- **Press enter on an empty field, or `esc`, to decline.** The run ends with `needs-input` instead
+  of guessing on your behalf.
+
+In headless mode (`--print`, or any non-TTY stdout) there is nobody to type, so the question is
+surfaced as a `notice` event and the run continues on a "you were asked and told it to continue"
+note rather than a fabricated answer. Headless messages go through the event stream, not raw stdout,
+so `--json` stays line-by-line parseable.
+
+Related hardening: `done`, `ask_user` and `completed` are routed **before** the tool registry is
+consulted. They are pseudo-options, not tools, so they can never be mistaken for an unknown tool
+name; a genuinely hallucinated tool name is corrected by substituting Jev's `fallback_action`
+runner-up, and the state says so on the next pass.
+
 ## Offline mode
 
 Both models can be mocked, so the whole loop is testable without a key or a GPU:
 
 ```bash
-npm run selftest                                   # runs in a temp workspace
+npm test                                           # regression suite (offline, no key)
+npm run selftest                                   # end-to-end run in a temp workspace
 jeffrey --jev-mock --llm-mock --print --yes "add a farewell helper"
 ```
 
 - `--jev-mock` replaces System One with a deterministic scripted decider. Optional tool list:
   `--jev-mock=read_file,edit_file,run_shell`.
+- `--jev-mock-script <json>` drives the same mock through a scenario, which is how the recovery
+  ladder is regression-tested offline:
+
+  ```bash
+  jeffrey --print --llm-mock --jev-mock-script '{"tools":["read_file","read_file","read_file","read_file","read_file","read_file","read_file","read_file","read_file","read_file","read_file","read_file","read_file","read_file","read_file","read_file"],"stuck":0.91,"stuckFromStep":4}' "check whether src exists and report back"
+  ```
+
+  It loops on `read_file` for four steps, then escalates: each round withholds one more tool
+  (`write_file`, then `edit_file`, `list_dir`, `glob`) and ends by handing the loop to you.
+
+  Knobs: `tools` (one tool per routing call, in order), `confidence`, `stuck`, `stuckFromStep`,
+  `stuckUntilCall` (stop reporting `stuck` from this call on, so the agent can be seen breaking out
+  of a loop rather than only handing off), `needsUser`, `finalGoalReached`, `hallucinations` (map of
+  routing call → bogus tool name) and `hallucinateFallback`.
+
 - `--llm-mock` replaces the executor with one that emits a valid call for whatever tool Jev chose,
   synthesising arguments from the tool schema and passing Jev's settled arguments straight through.
   It is a plumbing check, not a reasoning check.
@@ -136,6 +206,7 @@ jeffrey --jev-mock --llm-mock --print --yes "add a farewell helper"
 | `-C, --cwd <dir>` | Workspace root (default: cwd) |
 | `--config <path>` | Explicit config file (replaces the default lookup) |
 | `--max-steps <n>` | Step ceiling, default 24 |
+| `--max-recoveries <n>` | Loop recoveries before handing back to you, default 3 |
 | `-y, --yes` / `--dry-run` | Auto-approve / deny mutating tools |
 | `--explain` | Show probability legends and full Jev reasoning |
 | `--print` / `--json` | Headless transcript / JSON event stream |
@@ -159,6 +230,7 @@ Each step the decider asks Jev a batch of questions in one request:
 
 `Agent.run()` converts those into one of six routes — `goal-reached`, `jev-finish`, `act`,
 `act-low-confidence`, `ask-user`, `stuck-escalation` — and only `act` reaches tool execution.
+`stuck-escalation` feeds the recovery ladder described above rather than ending the run.
 
 ## Layout
 

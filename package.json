@@ -20,6 +20,7 @@
     "dev": "tsx src/cli.tsx",
     "start": "node bin/jeffrey.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test test/*.test.ts",
     "selftest": "mkdir -p \"${TMPDIR:-/tmp}/jeffrey-selftest\" && tsx src/cli.tsx --jev-mock --llm-mock --print --yes -C \"${TMPDIR:-/tmp}/jeffrey-selftest\" \"selftest: prove the loop routes, executes and re-scores\""
   },
   "dependencies": {

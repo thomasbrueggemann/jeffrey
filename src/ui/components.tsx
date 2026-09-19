@@ -370,6 +370,13 @@ export function renderBlock(block: Block, explain: boolean) {
 /* ------------------------------------------------------------------ approval */
 
 export function ApprovalBox({ request }: { request: ApprovalRequest }) {
+  // `ask_user` carries its payload in `question`, and that question is the whole point of the box —
+  // folding it into the one-line args preview would clip it to 40 characters and lose the ask.
+  const args = { ...(request.args as Record<string, unknown> | undefined) };
+  const question =
+    request.question ?? (typeof args.question === 'string' ? args.question : null);
+  delete args.question;
+
   return (
     <Box
       flexDirection="column"
@@ -380,13 +387,16 @@ export function ApprovalBox({ request }: { request: ApprovalRequest }) {
       marginTop={1}
     >
       <Text color={theme.warn} bold>
-        approval needed — {request.tool}
+        {question ? 'the agent is asking you a question' : `approval needed — ${request.tool}`}
       </Text>
       <Text color={theme.muted}>{request.reason}</Text>
-      <Text color={theme.text}>{formatArgs(request.args as Record<string, unknown>)}</Text>
+      {question ? <Text color={theme.text}>{truncate(question, 400)}</Text> : null}
+      {question ? null : <Text color={theme.text}>{formatArgs(args)}</Text>}
       {request.preview ? <Text color={theme.muted}>{truncate(request.preview, 500)}</Text> : null}
       <Text color={theme.dim}>
-        risk {request.risk.toFixed(1)} · [y] allow · [a] always allow {request.tool} · [n] deny
+        {question
+          ? 'type your answer and press enter · esc to decline'
+          : `risk ${request.risk.toFixed(1)} · [y] allow · [a] always allow ${request.tool} · [n] deny`}
       </Text>
     </Box>
   );

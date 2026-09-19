@@ -1,7 +1,7 @@
 import { readFile, readdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join, relative } from 'node:path';
-import type { AgentEvent, ApprovalChoice, ApprovalRequest, Budget, DoneReason, JevDecision, StepRecord } from '../types.js';
+import type { AgentEvent, ApprovalChoice, ApprovalRequest, ApprovalResponse, Budget, DoneReason, JevDecision, StepRecord } from '../types.js';
 import type { Config } from '../config.js';
 import type { LlmClient, LlmMessage } from './llm.js';
 import { Decider, ASK_USER_OPTION, FINISH_OPTION, type DeciderContext, type HistoryEntry } from './decider.js';
@@ -15,6 +15,10 @@ export interface RecoveryPlan {
   kind: 'improvise' | 'handoff' | 'terminal';
   /** One-line statement of the loop, for the user and for Jev. */
   diagnosis: string;
+  /** What the agent has already tried and given up on — the context a human needs to answer. */
+  context: string;
+  /** The question itself, with no diagnosis repeated: shown on its own line in the approval box. */
+  question: string;
   /** The hand-off question, or the closing report. */
   summary: string;
   /** Tools withheld from the next choice set. */
@@ -30,6 +34,23 @@ export interface RecoveryPlan {
 const MAX_ROUNDS_PER_STEP = 6;
 const MAX_TOOL_CORRECTIONS = 2;
 
+/**
+ * Approvals are usually a bare choice, but a question's approval carries the user's typed answer
+ * alongside it. Normalising here keeps every call site reading the same shape.
+ */
+function normaliseApproval(response: ApprovalResponse): { choice: ApprovalChoice; answer?: string } {
+  if (typeof response === 'string') return { choice: response };
+  return { choice: response.choice, answer: response.answer?.trim() || undefined };
+}
+
+/**
+ * The line Jev reads when the user answered a question. It is deliberately phrased as an instruction
+ * from the user rather than as narration, because it lands in `steering` — input to the next decision.
+ */
+function answerSteering(question: string, answer: string): string {
+  return `You asked the user: "${question}"\nThey answered: "${answer}"\nTreat that as authoritative and act on it. Do not ask the same question again.`;
+}
+
 function summarise(args: Record<string, unknown>): string {
   return (
     Object.entries(args)
@@ -44,7 +65,7 @@ export interface AgentOptions {
   llm: LlmClient;
   jev: JevClient;
   onEvent: (event: AgentEvent) => void;
-  approve: (request: ApprovalRequest) => Promise<ApprovalChoice>;
+  approve: (request: ApprovalRequest) => Promise<ApprovalResponse>;
   signal?: AbortSignal;
   toolMode?: ToolMode;
   /** Ask the executor for a one-line report after each tool run. */
@@ -92,6 +113,12 @@ export class Agent {
   private steering: string[] = [];
   /** Tools withheld from the choice set because they have stopped moving the goal. */
   private readonly excludedTools = new Set<string>();
+  /**
+   * How often Jev re-selected each tool while escalating. A re-selected tool never runs, so it leaves
+   * no trace in `history` — without this the diagnosis would freeze on the first repeated tool and
+   * the ladder would keep withholding the same thing and learn nothing.
+   */
+  private readonly reselects = new Map<string, number>();
   /** Loop recoveries used so far, and bad-tool-name corrections used so far. */
   private recoveries = 0;
   private toolCorrections = 0;
@@ -209,45 +236,71 @@ export class Agent {
         }
 
         if (decision.route === 'ask-user') {
-          const choice = await this.options.approve({
-            tool: ASK_USER_OPTION,
-            args: { goal: this.options.goal, question: this.openQuestion(decision) },
-            risk: 0,
-            reason: `Jev judged that the next step needs information only you have (p=${decision.needsUserInput.toFixed(2)}).`,
-          });
-          if (choice === 'deny') {
+          const question = this.openQuestion(decision);
+          const approval = normaliseApproval(
+            await this.options.approve({
+              tool: ASK_USER_OPTION,
+              args: { goal: this.options.goal, question },
+              question,
+              risk: 0,
+              reason: `Jev judged that the next step needs information only you have (p=${decision.needsUserInput.toFixed(2)}).`,
+            })
+          );
+          if (approval.choice === 'deny') {
             return { reason: 'aborted', summary: 'User declined to continue.', decision };
           }
-          this.notes += '\nUser was asked and chose to continue.';
-          this.steering = ['You just asked the user and they told you to continue. Do not ask again now — act.'];
+          this.steering = approval.answer
+            ? [answerSteering(question, approval.answer)]
+            : ['You just asked the user and they told you to continue. Do not ask again now — act.'];
+          this.notes += approval.answer
+            ? `\nThe user answered "${approval.answer}".`
+            : '\nUser was asked and chose to continue.';
           const failure = await reask();
           if (failure) return failure;
           continue;
         }
 
         if (decision.route === 'stuck-escalation') {
+          if (TOOLS_BY_NAME.has(decision.tool)) {
+            this.reselects.set(decision.tool, (this.reselects.get(decision.tool) ?? 0) + 1);
+          }
           const plan = this.planRecovery(decision);
-          onEvent({ type: 'notice', level: 'warn', message: plan.diagnosis });
 
           if (plan.kind === 'terminal') {
-            onEvent({ type: 'notice', level: 'error', message: plan.summary });
+            // The final block already names the diagnosis and the open question; a notice would be
+            // the same paragraph a third time.
             return { reason: 'needs-input', summary: plan.summary, decision };
           }
 
           if (plan.kind === 'handoff') {
+            // One notice per round: the hand-off's message is the diagnosis plus the question, so a
+            // separate diagnosis warning would just say it twice.
             onEvent({ type: 'notice', level: 'warn', message: plan.summary });
-            const choice = await this.options.approve({
-              tool: ASK_USER_OPTION,
-              args: { goal: this.options.goal, question: plan.summary },
-              risk: 0,
-              reason: plan.diagnosis,
-            });
-            if (choice === 'deny') {
+            const approval = normaliseApproval(
+              await this.options.approve({
+                tool: ASK_USER_OPTION,
+                args: { goal: this.options.goal, question: plan.question },
+                question: plan.question,
+                risk: 0,
+                reason: `${plan.diagnosis} ${plan.context}`,
+              })
+            );
+            if (approval.choice === 'deny') {
               return { reason: 'needs-input', summary: plan.summary, decision };
             }
-            this.notes += `\nThe user was told the agent was looping and told it to keep going: ${plan.summary}`;
+            this.notes += approval.answer
+              ? `\nThe user was told the agent was looping and answered "${approval.answer}".`
+              : `\nThe user was told the agent was looping and told it to keep going: ${plan.summary}`;
+            // `applyRecovery` replaces the steering with the recovery's own facts, so the answer has
+            // to be appended after it or it is thrown away on the very step it was meant to steer.
+            this.applyRecovery(plan);
+            if (approval.answer) {
+              this.steering.push(answerSteering(plan.question, approval.answer));
+            }
+          } else {
+            onEvent({ type: 'notice', level: 'warn', message: plan.diagnosis });
+            this.applyRecovery(plan);
           }
-          this.applyRecovery(plan);
           const failure = await reask();
           if (failure) return failure;
           continue;
@@ -320,13 +373,15 @@ export class Agent {
         decision.risk >= 0.5;
 
       if (needsApproval) {
-        const choice = await this.options.approve({
-          tool: tool.name,
-          args,
-          preview,
-          risk: decision.risk,
-          reason: `Jev picked ${tool.name} (confidence ${decision.confidence.toFixed(2)}, risk ${decision.risk.toFixed(1)}/4).`,
-        });
+        const { choice } = normaliseApproval(
+          await this.options.approve({
+            tool: tool.name,
+            args,
+            preview,
+            risk: decision.risk,
+            reason: `Jev picked ${tool.name} (confidence ${decision.confidence.toFixed(2)}, risk ${decision.risk.toFixed(1)}/4).`,
+          })
+        );
         if (choice === 'deny') {
           this.record(step, tool.name, args, false, 'user denied this action', decision.progress);
           onEvent({
@@ -410,23 +465,44 @@ export class Agent {
     const recent = this.history.slice(-6);
     const counts = new Map<string, number>();
     for (const entry of recent) counts.set(entry.tool, (counts.get(entry.tool) ?? 0) + 1);
-    const ranked = [...counts.entries()].sort((a, b) => b[1] - a[1]).map(([name]) => name);
-    const repeated = ranked[0] ?? '';
+    const ranked = [...counts.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([name]) => name);
+    const executedTop = ranked[0];
+    const reselecting = this.reselects.get(decision.tool) ?? 0;
     const goalPercent = Math.round(decision.goalReached * 100);
     const ceiling = Math.max(1, Object.keys(decision.progressLegend).length - 1);
 
+    // Withhold progressively more of what is not working: what ran repeatedly, plus what Jev keeps
+    // re-selecting while it escalates. Preferring names that are not yet withheld is what makes each
+    // round of the ladder a new attempt rather than the same one twice. The decider never excludes
+    // everything, so there is always a move left to choose.
+    const weights = new Map(counts);
+    for (const [name, n] of this.reselects) weights.set(name, (weights.get(name) ?? 0) + n);
+    const fresh = [...weights.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .map(([name]) => name)
+      .filter((name) => !this.excludedTools.has(name));
+    const exclude = fresh.slice(0, Math.min(3, this.recoveries + 1));
+    const withheld = [...new Set([...this.excludedTools, ...exclude])];
+
     const diagnosis =
-      `Jev detected a loop (stuck p=${decision.stuck.toFixed(2)}) after ${this.history.length} steps` +
-      (repeated ? `: ${repeated} ran ${counts.get(repeated)} of the last ${recent.length}` : '') +
-      `, and the goal score is not moving (progress ${decision.progress.toFixed(1)}/${ceiling}, goal ${goalPercent}%).`;
+      `Jev reported a loop (stuck p=${decision.stuck.toFixed(2)}) after ${this.history.length} steps` +
+      (executedTop ? `: ${executedTop} ran ${counts.get(executedTop)} of the last ${recent.length}` : '') +
+      (reselecting && decision.tool !== executedTop
+        ? `, and it keeps choosing ${decision.tool} instead of acting on it`
+        : '') +
+      `, while the goal score stayed at ${goalPercent}% (progress ${decision.progress.toFixed(1)}/${ceiling}).`;
 
-    const summary =
-      `${diagnosis} I withheld ${[...this.excludedTools].join(', ') || 'nothing'} and widened the context ` +
-      'without getting unstuck. What should I do differently?';
+    const context =
+      `I withheld ${withheld.join(', ') || 'nothing'} and widened the context without getting unstuck.`;
+    const question = 'What should I do differently?';
+    const summary = `${diagnosis} ${context} ${question}`;
 
-    // Terminal only after an improvised attempt has already followed a hand-off to the user.
+    // Terminal only after an improvised attempt has already followed a hand-off to the user. Nothing
+    // new is withheld here, so the summary naming the full set stays accurate.
     if (this.handedOff && this.recoveries >= maxRecoveries) {
-      return { kind: 'terminal', diagnosis, summary, exclude: [], steering: [] };
+      return { kind: 'terminal', diagnosis, context, question, summary, exclude: [], steering: [] };
     }
 
     const steering = [
@@ -444,15 +520,11 @@ export class Agent {
       );
     }
 
-    // Withhold progressively more of what is not working. The decider never excludes everything,
-    // so there is always a move left to choose.
-    const exclude = ranked.slice(0, Math.min(3, this.recoveries + 1));
-
     if (!this.handedOff && this.recoveries >= maxRecoveries) {
       this.handedOff = true;
-      return { kind: 'handoff', diagnosis, summary, exclude, steering };
+      return { kind: 'handoff', diagnosis, context, question, summary, exclude, steering };
     }
-    return { kind: 'improvise', diagnosis, summary, exclude, steering };
+    return { kind: 'improvise', diagnosis, context, question, summary, exclude, steering };
   }
 
   private applyRecovery(plan: RecoveryPlan): void {
