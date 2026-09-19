@@ -1,0 +1,7 @@
+{
+  "name": "todo",
+  "version": "1.0.0",
+  "type": "module",
+  "bin": { "todo": "src/cli.js" },
+  "scripts": { "test": "node --test" }
+}
