@@ -3,9 +3,11 @@
 Jeffrey vs. OpenCode on the same local model, five tasks, scored by hidden tests. Method and caveats:
 [README.md](README.md).
 
-**Setup.** Qwen3.6-35B-A3B-oQ4-mtp on oMLX (Apple silicon), thinking on, 32k max output. OpenCode
-1.18.15 with defaults. Jeffrey with `quickExtraBody` set (no thinking for notes, criteria and retries).
-One run per task and agent, 2026-09-19. The pricing-bugfix Jeffrey row is from the latest build. The
+## Setup
+
+Qwen3.6-35B-A3B-oQ4-mtp on oMLX (Apple silicon), thinking on, 32k max output. OpenCode 1.18.15
+with defaults. Jeffrey with `quickExtraBody` set (no thinking for notes, criteria and retries). One
+run per task and agent, 2026-09-19. The pricing-bugfix Jeffrey row is from the latest build. The
 other Jeffrey rows are from the build just before it, which differs only in when a run may stop
 (sending a premature "done" back once).
 
@@ -16,7 +18,8 @@ other Jeffrey rows are from the build just before it, which differs only in when
 | **Jeffrey** | **15m 16s** | **195,193** | **46/47** |
 | OpenCode | 17m 30s | 1,196,676 | 44/47 |
 
-Jeffrey also used 444k tokens on Jev, the remote decision model. That's a separate API, so it doesn't count toward local tokens.
+Jeffrey also used 444k tokens on Jev, the remote decision model. Jev is a separate API and is not
+counted in local tokens.
 
 ## Per task
 
@@ -38,15 +41,15 @@ and pricing-bugfix's rule that a discount never makes an amount negative (both o
 
 ## Takeaways
 
-- **6× fewer local tokens, same or better correctness.** OpenCode resends its whole conversation on
-  every request: 14–17k prompt tokens each by the end of a feature task. Jeffrey gives the executor a
-  fresh, bounded brief every step.
-- **Faster overall, but not on every task.** Jeffrey was faster on three tasks and level on one
+- 6× fewer local tokens, with the same or better correctness. OpenCode resends its whole
+  conversation on every request: 14 to 17k prompt tokens each by the end of a feature task. Jeffrey
+  gives the executor a fresh, bounded brief every step.
+- Faster in total, though not on every task. Jeffrey was faster on three tasks and level on one
   (5m 27s vs 5m 24s). On the short bug fix, OpenCode's single conversation finished sooner.
-- **Only Jeffrey got the documented rule that no visible test covers.** Its acceptance criteria are
+- Only Jeffrey got the documented rule that no visible test covers. Its acceptance criteria are
   planned from the files the task names, and it finishes only when the criteria are proven in the files
   and the project's tests pass.
-- **Jev tokens are Jeffrey's largest remaining cost.** About 444k across the suite, mostly because
+- Jev tokens are Jeffrey's largest remaining cost. About 444k across the suite, mostly because
   every step sends the full state to Jev twice.
 
 ## Reproduce

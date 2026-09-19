@@ -1,14 +1,14 @@
 # jeffrey
 
-A coding-agent CLI with **two models and a clear division of labour**:
+A coding-agent CLI that splits the work between two models:
 
-- **Jev** ([TypeSafe System One](https://docs.typesafe.ai/introduction)) is the decider. It never
-  writes prose or code — it only answers closed questions. Every step it picks the next tool,
-  scores how much progress was made, estimates risk, and tells us whether the goal is reached.
-- **Your LLM** (any OpenAI-compatible server, local by default) is the executor. It fills in the
-  tool arguments — the actual code — for whatever tool Jev chose.
+- Jev ([TypeSafe System One](https://docs.typesafe.ai/introduction)) decides. It never writes prose
+  or code; it only answers closed questions. On every step it picks the next tool, scores how much
+  progress was made, estimates risk, and says whether the goal is reached.
+- Your LLM (any OpenAI-compatible server, local by default) executes. It fills in the tool
+  arguments, which is where the actual code comes from, for whatever tool Jev chose.
 
-The loop is: `Jev → tool → Jev → tool → …` until Jev scores the goal as reached, or escalates.
+The loop is `Jev → tool → Jev → tool → …` until Jev scores the goal as reached, or escalates.
 
 ```
             goal
@@ -80,23 +80,25 @@ A thinking model (Qwen3) thinks before every answer, and the thinking counts aga
 Give the executor room (`"maxTokens": 32768` is fine for a local model), and switch thinking off
 where it only costs time: the three-sentence note, the criteria, and executor retries (a rejected
 call is fixed mechanically; a cut-off reply is retried without thinking before its budget is doubled).
-With it set, a first attempt gets `thinkingAllowance` tokens to think in on top of its answer, not the
-whole `maxTokens`, so a runaway is cut off in about two minutes rather than eight. Edits and writes to
-`.js`/`.mjs`/`.cjs`/`.json` files are parse-checked before they touch the disk:
+With the setting below, a first attempt gets `thinkingAllowance` tokens of thinking room on top of
+its answer instead of the whole `maxTokens`, so a runaway is cut off in about two minutes rather
+than eight:
 
 ```jsonc
 "quickExtraBody": { "chat_template_kwargs": { "enable_thinking": false } }
 ```
 
+Edits and writes to `.js`/`.mjs`/`.cjs`/`.json` files are parse-checked before they touch the disk.
+
 The workspace is always the folder `jeffrey` starts in (or `--cwd`); a global config cannot pin it.
 
 Before finishing, Jeffrey runs the project's tests (and, unattended, once before the first step). The
-command is detected — npm/pnpm/yarn/bun, cargo, go, pytest/unittest, maven, gradle, dotnet, mix, rspec,
-`make test` — or set with `"agent": { "testCommand": "…" }`, or turned off with `false`. Detection,
+command is detected (npm/pnpm/yarn/bun, cargo, go, pytest/unittest, maven, gradle, dotnet, mix, rspec,
+`make test`), set with `"agent": { "testCommand": "…" }`, or turned off with `false`. Detection,
 parse checks and import lookup are tables in [src/core/languages.ts](src/core/languages.ts); a language
 that is not in them gets no guesses, only the language-neutral agent.
 
-Check what it actually resolved to before blaming the model:
+To see what the layering resolved to:
 
 ```bash
 jeffrey --show-config     # effective config, secrets redacted
@@ -112,7 +114,7 @@ jeffrey --print "fix the failing test"                  # headless transcript
 cat task.txt | jeffrey --json                           # one JSON event per line
 ```
 
-The TUI behaves like Claude Code / opencode: frozen step history that scrolls, a live step with
+The TUI works like Claude Code or opencode: frozen step history that scrolls, a live step with
 Jev's confidence and score meters, inline diffs, a status bar, `esc` to abort a run, and a prompt
 that stays open for the next goal.
 
@@ -136,40 +138,40 @@ Use `-y/--yes` to auto-approve, or `--dry-run` to deny every mutating tool and s
 
 `read_file`, `write_file`, `edit_file`, `multi_edit`, `list_dir`, `glob`, `grep`, `run_shell`.
 
-Jev chooses among them; it can also answer `done` (goal reached), `ask_user`, or decline the
-shortlist entirely so the executor proposes the argument itself — which is how new files get
+Jev chooses among them. It can also answer `done` (goal reached), `ask_user`, or decline the
+shortlist entirely so the executor proposes the argument itself, which is how new files get
 created.
 
 ## When it gets stuck
 
-Jev reports `stuck` as a probability, and the agent treats it as a signal to change strategy — not
-as a reason to die. When `stuck` crosses the escalation bar the loop **improvises**:
+Jev reports `stuck` as a probability, and the agent treats it as a signal to change strategy rather
+than a reason to stop. When `stuck` crosses the escalation bar the loop improvises:
 
-1. **Diagnose.** The repeated tool calls, Jev's re-selections and its own `progress` / `goal_reached`
-   scores are folded into one sentence — "Jev reported a loop (stuck p=0.91) after 4 steps: read_file
+1. Diagnose. The repeated tool calls, Jev's re-selections and its own `progress` / `goal_reached`
+   scores are folded into one sentence: "Jev reported a loop (stuck p=0.91) after 4 steps: read_file
    ran 4 of the last 4, and it keeps choosing write_file instead of acting on it, while the goal score
-   stayed at 4% (progress 1.8/4)." It is deliberately compact: it is rendered inside the TUI's notice
-   box and again in the final block, and a diagnosis that gets clipped mid-sentence is worthless.
-2. **Withhold the tool.** The moves that are not working are removed from the shortlist, both from
+   stayed at 4% (progress 1.8/4)." The sentence is kept short because it is rendered inside the TUI's
+   notice box and again in the final block, and a diagnosis clipped mid-sentence is useless.
+2. Withhold the tool. The moves that are not working are removed from the shortlist, both from
    the list Jev is offered and from the state description, so a confident model cannot pick them
    again. Asking politely does not survive a confident model. Re-selecting a tool is itself a signal:
    a tool Jev keeps choosing but never gets to run leaves no trace in the step history, so it is
-   tracked separately and withheld too — otherwise each round would withhold the same name and the
+   tracked separately and withheld too; otherwise each round would withhold the same name and the
    ladder would not move.
-3. **Escalate steering.** A directive is added to the state: avoid what already failed, try another
+3. Escalate steering. A directive is added to the state: avoid what already failed, try another
    tool, and make the next call different in kind. From the second round the state also carries the
    verbatim outcomes so far, and from the third it restates the goal and asks for the actual
    deliverable.
-4. **Re-ask.** Jev decides again, with history intact.
+4. Re-ask. Jev decides again, with history intact.
 
-A re-ask costs **2 Jev calls and zero steps** — recoveries never burn your step budget. The ladder
+A re-ask costs 2 Jev calls and zero steps; recoveries never consume the step budget. The ladder
 escalates on each attempt (each round withholds more, and the steering gets blunter) and is bounded
 by `--max-recoveries` (default 3, `JEFFREY_MAX_RECOVERIES`).
 
-If the ladder is exhausted and Jev still cannot make progress, jeffrey stops improvising and
-**hands back to you**: the approval box names what was tried and why it stalled, states the question
-on its own line ("What should I do differently?"), and the run ends with the `needs-input` outcome
-(`◐ needs your input`, amber — a pause, not a failure) and exit code 1. A question Jev asks
+If the ladder is exhausted and Jev still cannot make progress, jeffrey stops improvising and hands
+back to you: the approval box names what was tried and why it stalled, states the question on its
+own line ("What should I do differently?"), and the run ends with the `needs-input` outcome
+(`◐ needs your input`, in amber, a pause rather than a failure) and exit code 1. A question Jev asks
 explicitly via `ask_user` ends the same way, so "needs a human" never looks like "crashed".
 
 ### Answering a question
@@ -177,10 +179,10 @@ explicitly via `ask_user` ends the same way, so "needs a human" never looks like
 When Jev asks, the approval box switches to a question prompt: the argument preview is hidden, the
 title reads "the agent is asking you a question", and a text field replaces the status bar.
 
-- **Type your answer and press enter.** It is handed back to Jev as steering — quoted in the next
-  state, recorded in the run notes, and re-decided immediately. The answer steers *the step it was
-  given for*, so it is applied after the recovery plan rather than being overwritten by it.
-- **Press enter on an empty field, or `esc`, to decline.** The run ends with `needs-input` instead
+- Type your answer and press enter. It is handed back to Jev as steering: quoted in the next
+  state, recorded in the run notes, and re-decided immediately. The answer steers the step it was
+  given for, so it is applied after the recovery plan rather than being overwritten by it.
+- Press enter on an empty field, or `esc`, to decline. The run ends with `needs-input` instead
   of guessing on your behalf.
 
 In headless mode (`--print`, or any non-TTY stdout) there is nobody to type, so the question is
@@ -188,9 +190,9 @@ surfaced as a `notice` event and the run continues on a "you were asked and told
 note rather than a fabricated answer. Headless messages go through the event stream, not raw stdout,
 so `--json` stays line-by-line parseable.
 
-Related hardening: `done`, `ask_user` and `completed` are routed **before** the tool registry is
-consulted. They are pseudo-options, not tools, so they can never be mistaken for an unknown tool
-name; a genuinely hallucinated tool name is corrected by substituting Jev's `fallback_action`
+Related hardening: `done`, `ask_user` and `completed` are routed before the tool registry is
+consulted. They are pseudo-options rather than tools, so they can never be mistaken for an unknown
+tool name; a genuinely hallucinated tool name is corrected by substituting Jev's `fallback_action`
 runner-up, and the state says so on the next pass.
 
 ## Offline mode
@@ -222,7 +224,7 @@ jeffrey --jev-mock --llm-mock --print --yes "add a farewell helper"
 
 - `--llm-mock` replaces the executor with one that emits a valid call for whatever tool Jev chose,
   synthesising arguments from the tool schema and passing Jev's settled arguments straight through.
-  It is a plumbing check, not a reasoning check.
+  It tests the plumbing only and says nothing about reasoning quality.
 
 `--cwd` must already exist; the CLI refuses to run rather than create it for you.
 
@@ -254,31 +256,32 @@ Each step the decider asks Jev a batch of questions in one request:
 | `relevant.<tool>` | noul | Probability each tool is relevant, used to keep the shortlist small |
 | `goal_reached` | noul | Is the goal satisfied? |
 | `criterion.<n>` | noul | Is acceptance criterion *n* met, on the evidence so far? |
-| `progress` | score | 0–4: how much has actually been established |
+| `progress` | score | 0 to 4: how much has actually been established |
 | `stuck` | noul | The agent is looping; escalate |
 | `needs_user` | noul | Requires human input; stop and ask |
-| `risk` | score | 0–4: how hard is this to reverse |
+| `risk` | score | 0 to 4: how hard is this to reverse |
 | `<tool>.<arg>` | choice / noul | Which value for an argument with a closed set |
 
-`Agent.run()` converts those into one of six routes — `goal-reached`, `jev-finish`, `act`,
-`act-low-confidence`, `ask-user`, `stuck-escalation` — and only `act` reaches tool execution.
+`Agent.run()` converts those into one of six routes (`goal-reached`, `jev-finish`, `act`,
+`act-low-confidence`, `ask-user`, `stuck-escalation`), and only `act` reaches tool execution.
 `stuck-escalation` feeds the recovery ladder described above rather than ending the run.
 
 ### Keeping track of the trajectory
 
 Neither model remembers anything between calls, and both only see the last few steps. So the agent
-keeps a **ledger** ([src/core/ledger.ts](src/core/ledger.ts)) and passes it to Jev's state and the
+keeps a ledger ([src/core/ledger.ts](src/core/ledger.ts)) and passes it to Jev's state and the
 executor's brief on every step:
 
-- **Acceptance criteria.** Before the first step the executor turns the goal into 2–4 checkable
+- Acceptance criteria. Before the first step the executor turns the goal into 2 to 4 checkable
   criteria. Jev scores each one every step. `goal-reached` needs all of them met (at or above
   `agent.criterionMetThreshold`, default 0.6) as well as `goal_reached` and `progress`. Jev choosing
   `done` is still final. The first open criterion is shown as the `focus`.
-- **Files changed, commands run, failed attempts.** Built from the history by code, not by a model.
-  A command's result is flagged once files have changed since it ran, and a repeated failure is counted.
-- **Facts.** The reporter can end its note with up to two `FACT:` lines. They are kept for the rest
+- Files changed, commands run, failed attempts. Built from the history by code; no model is
+  involved. A command's result is flagged once files have changed since it ran, and a repeated
+  failure is counted.
+- Facts. The reporter can end its note with up to two `FACT:` lines. They are kept for the rest
   of the run and flagged when their file changes afterwards.
-- **Evidence.** After a step that wrote or read a file, the reporter sees the file and the open
+- Evidence. After a step that wrote or read a file, the reporter sees the file and the open
   criteria, and adds a `MET <id>: <quote>` line for each one the file proves. The agent checks that the
   quote is really in the file (whitespace-insensitive; `...` elisions must match in order) and, when
   the criterion names files, that it is one of them. A proven criterion stays met whatever Jev scores,
