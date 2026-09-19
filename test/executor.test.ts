@@ -142,3 +142,33 @@ test('a call that stays invalid is not run, and Jev is told exactly why', async 
   assert.match(rejected.output, /executor could not produce a valid edit_file call/);
   assert.match(rejected.output, /does not occur/);
 });
+
+/** Cuts the first tool call off at `max_tokens`, then answers in full once the budget is raised. */
+class TruncatingExecutor implements LlmClient {
+  readonly label = 'truncating';
+  readonly budgets: Array<number | undefined> = [];
+
+  async complete(options: CompleteOptions): Promise<LlmResult> {
+    const usage = { promptTokens: 0, completionTokens: 0 };
+    if (!options.tools?.length) return { content: 'Yes: the edit applied.', toolCalls: [], usage, finishReason: 'stop' };
+    this.budgets.push(options.maxTokens);
+    if (this.budgets.length === 1) return { content: '<tool_call>\n<function=edit_file>', toolCalls: [], usage, finishReason: 'length' };
+    const args = { path: 'src/math.ts', old_string: '  return a - b;', new_string: '  return a + b;' };
+    return {
+      content: '',
+      toolCalls: [{ id: 'c1', type: 'function', function: { name: 'edit_file', arguments: JSON.stringify(args) } }],
+      usage,
+      finishReason: 'tool_calls',
+    };
+  }
+}
+
+test('a reply cut off at max_tokens is retried once with a bigger budget, not re-asked at the same one', async () => {
+  const llm = new TruncatingExecutor();
+  const { dir, events } = await runEdit(llm as unknown as ScriptedExecutor);
+
+  const base = DEFAULT_CONFIG.llm.maxTokens;
+  assert.deepEqual(llm.budgets.slice(0, 2), [base, base * 2], 'no JSON fallback at the budget that already overflowed');
+  assert.ok(events.some((e) => e.type === 'notice' && /cut off after \d+ tokens/.test(e.message)));
+  assert.equal(await readFile(join(dir, 'src', 'math.ts'), 'utf8'), SOURCE.replace('a - b', 'a + b'));
+});

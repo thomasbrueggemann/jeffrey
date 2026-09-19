@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { parseArgs, DEFAULT_MOCK_TOOLS } from '../src/cli.js';
@@ -89,4 +89,19 @@ test('--json keeps stdout parseable while approvals fire', async () => {
     events.some((event) => event.type === 'notice' && /question for you/.test(event.message ?? '')),
     'expected the question to surface as a notice event',
   );
+});
+
+test('a relative --cwd resolves from where jeffrey was started, once', () => {
+  const root = mkdtempSync(join(tmpdir(), 'jeffrey-cwd-'));
+  mkdirSync(join(root, 'a'));
+  mkdirSync(join(root, 'b'));
+  const before = process.cwd();
+  try {
+    process.chdir(join(root, 'a'));
+    const flags = parseArgs(['--cwd', '../b', 'look around']);
+    assert.equal(flags.cwd, realpathSync(join(root, 'b')));
+    assert.equal(process.cwd(), realpathSync(join(root, 'b')));
+  } finally {
+    process.chdir(before);
+  }
 });

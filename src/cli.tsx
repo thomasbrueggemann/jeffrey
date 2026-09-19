@@ -282,6 +282,8 @@ export function parseArgs(argv: string[]): Flags {
       fail(`--cwd ${flags.cwd} is not a directory`);
     }
     process.chdir(target);
+    // Resolved once, before the chdir: resolving a relative --cwd again afterwards lands elsewhere.
+    flags.cwd = target;
   }
   flags.goal = goal.join(' ').trim();
   return flags;

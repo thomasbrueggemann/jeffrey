@@ -203,6 +203,9 @@ export function loadConfig(overrides: ConfigOverrides = {}, env = process.env): 
   } else {
     const global = readJson(GLOBAL_CONFIG_PATH);
     if (global) {
+      // The workspace is where jeffrey was started. A global value would pin every run to one
+      // directory — `--init` used to write the cwd it ran in, which sent every later run there.
+      if (global.agent) delete global.agent.workspace;
       layers.push(global);
       sources.push(GLOBAL_CONFIG_PATH);
     }
@@ -261,5 +264,6 @@ export function configPaths(): { global: string; project: string } {
 export function writeStarterConfig(path: string, config: Config): void {
   const dir = join(path, '..');
   mkdirSync(dir, { recursive: true });
-  writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+  const { workspace: _workspace, ...agent } = config.agent;
+  writeFileSync(path, `${JSON.stringify({ ...config, agent }, null, 2)}\n`, 'utf8');
 }

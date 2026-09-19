@@ -50,6 +50,12 @@ const LOW_FINISH_GOAL_SCORE = 0.3;
 const MAX_TOOL_CORRECTIONS = 2;
 /** Executor calls rejected by `validateArgs` get this many second chances before the step fails. */
 const MAX_ARG_REPAIRS = 2;
+/**
+ * A reply cut off at `max_tokens` is not a bad answer, it is an unfinished one: asking again with the
+ * same budget just burns another full generation (a whole-file write_file at 4096 tokens never fits).
+ * So each truncated call doubles the budget, up to this ceiling.
+ */
+const MAX_TOKENS_CEILING = 32_768;
 
 /**
  * Approvals are usually a bare choice, but a question's approval carries the user's typed answer
@@ -698,6 +704,7 @@ export class Agent {
     const forced = (this.options.toolMode ?? 'forced') === 'forced';
     let args: Record<string, unknown> = {};
     let problems: string[] = [];
+    let maxTokens = config.llm.maxTokens;
 
     for (let attempt = 0; attempt <= MAX_ARG_REPAIRS; attempt++) {
       const messages: LlmMessage[] = [
@@ -723,8 +730,10 @@ export class Agent {
       ];
 
       let parsed: Record<string, unknown> | undefined;
-      if (forced) parsed = await this.llmCall(messages, tool, 'forced');
-      if (!parsed) parsed = await this.llmCall(messages, tool, 'prompt');
+      let truncated = false;
+      if (forced) ({ parsed, truncated } = await this.llmCall(messages, tool, 'forced', maxTokens));
+      // The JSON fallback would be cut off at the same budget; go straight to a bigger one instead.
+      if (!parsed && !truncated) ({ parsed, truncated } = await this.llmCall(messages, tool, 'prompt', maxTokens));
 
       args = schemaKeys(tool, parsed ?? {});
       for (const [key, value] of Object.entries(settled)) {
@@ -734,9 +743,18 @@ export class Agent {
         if (args[key] === undefined || args[key] === null) delete args[key];
       }
 
-      problems = parsed ? validateArgs(tool, args, workspace) : ['The reply contained no tool call and no JSON arguments.'];
+      if (truncated && !parsed) {
+        problems = [`The reply was cut off after ${maxTokens} tokens, before the tool call was complete.`];
+      } else {
+        problems = parsed ? validateArgs(tool, args, workspace) : ['The reply contained no tool call and no JSON arguments.'];
+      }
       if (!problems.length) break;
       if (attempt === MAX_ARG_REPAIRS) break;
+      if (truncated) {
+        if (maxTokens >= MAX_TOKENS_CEILING) break;
+        maxTokens = Math.min(maxTokens * 2, MAX_TOKENS_CEILING);
+        problems = [...problems, `Your token budget is now ${maxTokens}. Keep the reply to the tool call alone.`];
+      }
 
       this.options.onEvent({
         type: 'notice',
@@ -766,7 +784,8 @@ export class Agent {
     messages: LlmMessage[],
     tool: ToolSpec,
     mode: ToolMode,
-  ): Promise<Record<string, unknown> | undefined> {
+    maxTokens: number,
+  ): Promise<{ parsed: Record<string, unknown> | undefined; truncated: boolean }> {
     let buffer = '';
     const onToken = (token: string) => {
       buffer += token;
@@ -783,6 +802,7 @@ export class Agent {
             messages,
             tools: [spec],
             toolChoice: 'required',
+            maxTokens,
             onToken,
             signal: this.options.signal,
           })
@@ -796,6 +816,7 @@ export class Agent {
                   'No markdown fence, no explanation.',
               },
             ],
+            maxTokens,
             onToken,
             signal: this.options.signal,
           });
@@ -805,19 +826,20 @@ export class Agent {
     this.budget.llmCompletionTokens += result.usage.completionTokens;
     this.options.onEvent({ type: 'budget', budget: { ...this.budget } });
 
+    const truncated = result.finishReason === 'length';
     const call = result.toolCalls.find((entry) => entry.function.name === tool.name) ?? result.toolCalls[0];
     if (call) {
       const parsed = safeJson(call.function.arguments);
-      if (parsed) return parsed;
+      if (parsed) return { parsed, truncated };
     }
     if (mode === 'prompt') {
       const parsed = extractJsonObject(result.content);
       if (parsed) {
         const args = parsed['arguments'] ?? parsed;
-        if (typeof args === 'object' && args !== null) return args as Record<string, unknown>;
+        if (typeof args === 'object' && args !== null) return { parsed: args as Record<string, unknown>, truncated };
       }
     }
-    return undefined;
+    return { parsed: undefined, truncated };
   }
 
   private async narrate(
