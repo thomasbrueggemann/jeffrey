@@ -18,6 +18,7 @@ import { createLlmClient } from './core/llm.js';
 import { TypeSafeClient, listModels, type JevClient } from './core/jev.js';
 import { MockJevClient, type MockScript } from './core/mock-jev.js';
 import { Agent, type ToolMode } from './core/agent.js';
+import { SessionLog } from './core/session-log.js';
 import { App, type Runner } from './ui/App.js';
 import type { AgentEvent, ApprovalRequest, ApprovalResponse, Budget, JevDecision } from './types.js';
 
@@ -294,6 +295,8 @@ export interface Session {
   llmLabel: string;
   runner: Runner;
   mockJev?: MockJevClient;
+  /** The transcript for this session, or undefined when `agent.saveSessions` is off. */
+  log?: SessionLog;
 }
 
 function jevOverrides(flags: Flags): ConfigOverrides {
@@ -337,27 +340,42 @@ export function buildSession(flags: Flags): Session {
   const script: MockScript = flags.jevMockScript ?? { tools: flags.jevMock ?? DEFAULT_MOCK_TOOLS };
   const useMock = Boolean(flags.jevMockScript || flags.jevMock);
   const mockJev = useMock ? new MockJevClient(script) : undefined;
-  const jev: JevClient = mockJev ?? new TypeSafeClient(config.jev);
+  const log = config.agent.saveSessions ? new SessionLog() : undefined;
+  const rawJev: JevClient = mockJev ?? new TypeSafeClient(config.jev);
+  const jev = log ? log.wrapJev(rawJev) : rawJev;
   const llmLabel = config.llm.mock
     ? 'mock-executor'
     : `${config.llm.model} · ${config.llm.baseUrl.replace(/^https?:\/\//, '')}`;
+  log?.start({ version: VERSION, config, jevLabel: jev.label, llmLabel });
 
   const runner: Runner = async (goal, options) => {
+    log?.goal(goal);
+    const llm = createLlmClient(config.llm);
     const agent = new Agent({
       goal,
       config,
-      llm: createLlmClient(config.llm),
+      llm: log ? log.wrapLlm(llm) : llm,
       jev,
-      onEvent: options.onEvent,
-      approve: options.approve,
+      onEvent: log
+        ? (event) => {
+            log.event(event);
+            options.onEvent(event);
+          }
+        : options.onEvent,
+      approve: log ? log.wrapApprove(options.approve) : options.approve,
       signal: options.signal,
       toolMode: flags.toolMode,
       narrate: flags.narrate,
     });
-    await agent.run();
+    try {
+      await agent.run();
+    } catch (error) {
+      log?.failure(error);
+      throw error;
+    }
   };
 
-  return { config, jevLabel: jev.label, llmLabel, runner, ...(mockJev ? { mockJev } : {}) };
+  return { config, jevLabel: jev.label, llmLabel, runner, ...(mockJev ? { mockJev } : {}), ...(log ? { log } : {}) };
 }
 
 /* ------------------------------------------------------------------ headless output */
@@ -512,7 +530,7 @@ export async function main(): Promise<void> {
     return;
   }
 
-  const { config, jevLabel, llmLabel, runner } = buildSession(flags);
+  const { config, jevLabel, llmLabel, runner, log } = buildSession(flags);
   const headless = flags.print || !process.stdout.isTTY;
 
   if (headless) {
@@ -545,6 +563,8 @@ export async function main(): Promise<void> {
 
     await runner(goal, { onEvent: jsonPrinter, approve, signal: new AbortController().signal });
     const code = flags.json ? 0 : printer.finish();
+    // stderr, so `--json` on stdout stays parseable.
+    if (log) process.stderr.write(`session log: ${log.path}\n`);
     process.exitCode = code;
     return;
   }

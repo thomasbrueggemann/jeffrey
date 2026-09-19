@@ -1,6 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { parseArgs, DEFAULT_MOCK_TOOLS } from '../src/cli.js';
+
+/** Spawned runs write a session transcript under HOME; keep it out of the real ~/.jeffrey. */
+const isolatedEnv = () => {
+  const home = mkdtempSync(join(tmpdir(), 'jeffrey-home-'));
+  return { ...process.env, HOME: home, USERPROFILE: home };
+};
 
 /**
  * Argument parsing is the one place a bad guess is silent: `--jev-mock` used to accept a
@@ -54,7 +63,7 @@ test('the published bin runs main and produces output', async () => {
   const result = spawnSync(
     process.execPath,
     ['bin/jeffrey.js', '--jev-mock=read_file', '--print', 'read package.json'],
-    { cwd: new URL('..', import.meta.url).pathname, encoding: 'utf8', timeout: 60_000 },
+    { cwd: new URL('..', import.meta.url).pathname, encoding: 'utf8', timeout: 60_000, env: isolatedEnv() },
   );
   assert.equal(result.status, 0, `stderr: ${result.stderr}`);
   assert.match(result.stdout, /jev ->/, 'expected the CLI to render at least one decision line');
@@ -69,7 +78,7 @@ test('--json keeps stdout parseable while approvals fire', async () => {
   const result = spawnSync(
     process.execPath,
     ['bin/jeffrey.js', '--jev-mock=ask_user', '--print', '--json', 'do I need to write the file?'],
-    { cwd: new URL('..', import.meta.url).pathname, encoding: 'utf8', timeout: 60_000 },
+    { cwd: new URL('..', import.meta.url).pathname, encoding: 'utf8', timeout: 60_000, env: isolatedEnv() },
   );
   assert.equal(result.status, 0, `stderr: ${result.stderr}`);
 

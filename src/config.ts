@@ -104,6 +104,7 @@ export const DEFAULT_CONFIG: Config = {
 type DeepPartial<T> = { [K in keyof T]?: Partial<T[K]> };
 
 export const GLOBAL_CONFIG_PATH = join(homedir(), '.jeffrey', 'config.json');
+export const SESSIONS_DIR = join(homedir(), '.jeffrey', 'sessions');
 export const PROJECT_CONFIG_NAME = 'jeffrey.config.json';
 
 function readJson(path: string): DeepPartial<Config> | undefined {
@@ -161,6 +162,8 @@ function fromEnv(env: NodeJS.ProcessEnv): DeepPartial<Config> {
   if (maxRecoveries !== undefined) agent.maxRecoveries = maxRecoveries;
   const yolo = bool(env['JEFFREY_AUTO_APPROVE']);
   if (yolo !== undefined) agent.autoApprove = yolo;
+  const saveSessions = bool(env['JEFFREY_SAVE_SESSIONS']);
+  if (saveSessions !== undefined) agent.saveSessions = saveSessions;
 
   return { llm, jev, agent };
 }
