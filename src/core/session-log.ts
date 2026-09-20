@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import type { Config } from '../config.js';
 import { redact, SESSIONS_DIR } from '../config.js';
 import type { AgentEvent, ApprovalRequest, ApprovalResponse, Question, SystemOneResponse } from '../types.js';
-import type { JevClient } from './jev.js';
+import type { DecisionModel } from './decision.js';
 import type { CompleteOptions, LlmClient, LlmResult } from './llm.js';
 
 /**
@@ -95,10 +95,11 @@ export class SessionLog {
     };
   }
 
-  wrapJev(client: JevClient): JevClient {
+  wrapDecider(client: DecisionModel): DecisionModel {
     const log = this;
     return {
       label: client.label,
+      provider: client.provider,
       async ask(state: unknown, questions: Record<string, Question>): Promise<SystemOneResponse> {
         const call = ++log.callSeq;
         const started = Date.now();
@@ -151,7 +152,7 @@ export function describeConfig(config: Config): unknown {
       apiKey: redact(config.llm.apiKey),
       headers: Object.fromEntries(Object.entries(config.llm.headers).map(([key, value]) => [key, redact(value)])),
     },
-    jev: { ...config.jev, apiKey: redact(config.jev.apiKey) },
+    decider: { ...config.decider, apiKey: redact(config.decider.apiKey) },
     agent: config.agent,
   };
 }

@@ -6,9 +6,10 @@ import type { Config } from '../config.js';
 import type { LlmClient, LlmMessage } from './llm.js';
 import { Decider, ASK_USER_OPTION, EXECUTOR_DECIDES, FINISH_OPTION, type DeciderContext, type HistoryEntry } from './decider.js';
 import { ACTION_TOOLS, TOOLS_BY_NAME, compactDiff, type ToolContext, type ToolResult, type ToolSpec } from './tools.js';
-import type { JevClient } from './jev.js';
+import type { DecisionModel } from './decision.js';
 import { Ledger, containsQuote, parseCriteria, splitFacts, unwrapQuote } from './ledger.js';
 import { detectTestCommand, localImports } from './languages.js';
+import { availableTactics, tactic, tacticTools, type Tactic } from './recovery.js';
 import {
   CRITERIA_SYSTEM,
   REPORTER_SYSTEM,
@@ -36,8 +37,16 @@ export interface RecoveryPlan {
   question: string;
   /** The hand-off question, or the closing report. */
   summary: string;
-  /** Tools withheld from the next choice set. */
+  /** Tools withheld from the next choice set, for good. */
   exclude: string[];
+  /**
+   * The only tools offered on the next decision, when a tactic was chosen. One decision long, and
+   * it overrides `exclude`: a tactic is a fresh approach, so a tool an earlier rung gave up on is
+   * back on the table if this one calls for it.
+   */
+  restrict: string[];
+  /** The tactic this plan is trying, when Jev named a cause. See `recovery.ts`. */
+  tactic?: string;
   /** Facts for the next decision — input to it, not narration of the last one. */
   steering: string[];
 }
@@ -64,6 +73,13 @@ const THINK_THRESHOLD = 0.5;
  * So each truncated call doubles the budget, up to this ceiling.
  */
 const MAX_TOKENS_CEILING = 65_536;
+/**
+ * How sure Jev has to be about what the loop is before the next decision is restricted to one
+ * approach. Deliberately low: a diagnosis made under duress is uncertain by nature, and the
+ * alternative — another round of "stop repeating yourself" — is not a better use of the rung.
+ * Below it, the ladder falls back to withholding what has stopped working.
+ */
+const MIN_TACTIC_CONFIDENCE = 0.35;
 const MUTATING_TOOLS = new Set(['write_file', 'edit_file', 'run_shell']);
 
 /** Whether the goal mentions `path` by its path or, for a distinctive name, by its file name. */
@@ -119,6 +135,12 @@ function answerSteering(question: string, answer: string): string {
   return `You asked the user: "${question}"\nThey answered: "${answer}"\nTreat that as authoritative and act on it. Do not ask the same question again.`;
 }
 
+/** "a", "a and b", "a, b and c" — the recovery summary is read by a person, not parsed. */
+function joinList(items: string[]): string {
+  if (items.length <= 1) return items[0] ?? '';
+  return `${items.slice(0, -1).join(', ')} and ${items.at(-1)}`;
+}
+
 function summarise(args: Record<string, unknown>): string {
   return (
     Object.entries(args)
@@ -131,7 +153,7 @@ export interface AgentOptions {
   goal: string;
   config: Config;
   llm: LlmClient;
-  jev: JevClient;
+  jev: DecisionModel;
   onEvent: (event: AgentEvent) => void;
   approve: (request: ApprovalRequest) => Promise<ApprovalResponse>;
   signal?: AbortSignal;
@@ -174,6 +196,15 @@ export class Agent {
   private steering: string[] = [];
   /** Tools withheld from the choice set because they have stopped moving the goal. */
   private readonly excludedTools = new Set<string>();
+  /**
+   * The tactic's tools, offered alone on the next decision and then cleared. Restricting rather
+   * than excluding is what makes a recovery an approach instead of a prohibition.
+   */
+  private restrictTo: string[] = [];
+  /** Loop tactics already spent, so the next recovery has to try a different one. */
+  private readonly triedTactics = new Set<string>();
+  /** Whether the "could not diagnose the loop" notice has already been shown. */
+  private diagnosisFailed = false;
   /**
    * How often Jev re-selected each tool while escalating. A re-selected tool never runs, so it leaves
    * no trace in `history` — without this the diagnosis would freeze on the first repeated tool and
@@ -422,7 +453,7 @@ export class Agent {
           if (TOOLS_BY_NAME.has(decision.tool)) {
             this.reselects.set(decision.tool, (this.reselects.get(decision.tool) ?? 0) + 1);
           }
-          const plan = this.planRecovery(decision);
+          const plan = await this.planRecovery(step, decision);
 
           if (plan.kind === 'terminal') {
             // The final block already names the diagnosis and the open question; a notice would be
@@ -553,6 +584,9 @@ export class Agent {
       // A fresh one is built if the loop reports stuck again.
       const steering = this.steering;
       this.steering = [];
+      // The restriction has produced its move; the decision after this one chooses freely again,
+      // so a tactic that worked does not keep the run inside one tool for the rest of the run.
+      this.restrictTo = [];
 
       onEvent({ type: 'phase', phase: 'planning' });
       let args: Record<string, unknown>;
@@ -721,12 +755,17 @@ export class Agent {
   /**
    * Turn "Jev says we are looping" into a bounded plan instead of a terminal verdict.
    *
-   * The ladder escalates and is deliberately finite: improvise by withholding the moves that are
-   * not working and telling Jev what the loop looks like, then hand the problem to the user with a
-   * concrete question, then stop. The point is that a loop produces a *new* decision rather than a
-   * dead end, and that whatever ends the run names what was tried.
+   * The ladder escalates and is deliberately finite: try a different approach, then hand the
+   * problem to the user with a concrete question, then stop. The point is that a loop produces a
+   * *new* decision rather than a dead end, and that whatever ends the run names what was tried.
+   *
+   * The different approach comes from Jev: it is asked which of a closed set of causes explains
+   * the loop (`recovery.ts`), and the cause it names decides which tools the next decision may
+   * choose from. Withholding what did not work is the fallback for when it has no reading of the
+   * loop — it keeps the run moving, but it proposes nothing, and a loop is usually a wrong
+   * approach rather than a wrong tool.
    */
-  private planRecovery(decision: JevDecision): RecoveryPlan {
+  private async planRecovery(step: number, decision: JevDecision): Promise<RecoveryPlan> {
     const { maxRecoveries } = this.options.config.agent;
     const recent = this.history.slice(-6);
     const counts = new Map<string, number>();
@@ -760,37 +799,109 @@ export class Agent {
         : '') +
       `, while the goal score stayed at ${goalPercent}% (progress ${decision.progress.toFixed(1)}/${ceiling}).`;
 
-    const context =
-      `I withheld ${withheld.join(', ') || 'nothing'} and widened the context without getting unstuck.`;
+    // What the user is owed when the run ends here: the approaches that were spent, not just the
+    // tools that were withheld. "I tried running the tests and searching for it" is something a
+    // person can answer; "I withheld read_file" is not.
+    const spent = [...this.triedTactics].map((id) => tactic(id)?.attempt ?? id);
+    const context = spent.length
+      ? `I tried to ${joinList(spent)}, withheld ${withheld.join(', ') || 'nothing'}, and still did not get unstuck.`
+      : `I withheld ${withheld.join(', ') || 'nothing'} and widened the context without getting unstuck.`;
     const question = 'What should I do differently?';
-    const summary = `${diagnosis} ${context} ${question}`;
+    const say = (statement: string): string => `${statement} ${context} ${question}`;
 
     // Terminal only after an improvised attempt has already followed a hand-off to the user. Nothing
     // new is withheld here, so the summary naming the full set stays accurate.
     if (this.handedOff && this.recoveries >= maxRecoveries) {
-      return { kind: 'terminal', diagnosis, context, question, summary, exclude: [], steering: [] };
+      return { kind: 'terminal', diagnosis, context, question, summary: say(diagnosis), exclude: [], restrict: [], steering: [] };
     }
 
-    const steering = [
+    /** The escalation that applies whatever the plan is: what was tried, then what the goal was. */
+    const escalate = (steering: string[]): string[] => {
+      if (this.recoveries >= 1) steering.push(`What has already been tried, with outcomes:\n${this.recentOutcomes()}`);
+      if (this.recoveries >= 2) {
+        steering.push(`The goal, restated: ${this.options.goal}`);
+        steering.push(
+          'Produce the actual deliverable. If a file has to change, write_file or edit_file with real content; ' +
+            `if a human decision is blocking you, choose ${ASK_USER_OPTION}.`,
+        );
+      }
+      return steering;
+    };
+
+    // Ask what the loop is, while there is still a rung left to spend on the answer. On the last
+    // rung the answer would change nothing: the plan is the hand-off either way.
+    const chosen = this.recoveries < maxRecoveries ? await this.chooseTactic(step) : undefined;
+    if (chosen) {
+      this.triedTactics.add(chosen.id);
+      // The notice is rendered in the TUI's box and again in the final block, so it names the move
+      // and not the reasoning behind it: a diagnosis clipped mid-sentence is useless.
+      const trying = `${diagnosis} Trying a different approach — ${chosen.attempt}.`;
+      const move = tacticTools(chosen, ACTION_TOOLS);
+      if (!move.length) {
+        // `needs-user`: Jev's reading is that no tool breaks this loop, so the rung is spent on the
+        // person who can break it rather than on another move that cannot. Here the reading *is* the
+        // justification for interrupting, so the question carries it.
+        this.handedOff = true;
+        const asking = `${diagnosis} Jev's reading of why: ${chosen.cause}.`;
+        return { kind: 'handoff', diagnosis: asking, context, question, summary: say(asking), exclude: [], restrict: [], tactic: chosen.id, steering: escalate([diagnosis]) };
+      }
+      return {
+        kind: 'improvise',
+        diagnosis: trying,
+        context,
+        question,
+        summary: say(trying),
+        exclude: [],
+        restrict: move,
+        tactic: chosen.id,
+        // No "pick a different tool" line: the choice set is already down to this approach's tools,
+        // and the instruction says what to do with them, which is the part Jev cannot infer.
+        steering: escalate([diagnosis, chosen.instruction]),
+      };
+    }
+
+    // No reading of the loop, or none left to try: withhold what has stopped working and say so.
+    const steering = escalate([
       diagnosis,
       'Repeating a call that did not move the goal score is not a plan. Pick a different tool from tools_available.',
-    ];
-    if (this.recoveries >= 1) {
-      steering.push(`What has already been tried, with outcomes:\n${this.recentOutcomes()}`);
-    }
-    if (this.recoveries >= 2) {
-      steering.push(`The goal, restated: ${this.options.goal}`);
-      steering.push(
-        'Produce the actual deliverable. If a file has to change, write_file or edit_file with real content; ' +
-          `if a human decision is blocking you, choose ${ASK_USER_OPTION}.`,
-      );
-    }
+    ]);
 
     if (!this.handedOff && this.recoveries >= maxRecoveries) {
       this.handedOff = true;
-      return { kind: 'handoff', diagnosis, context, question, summary, exclude, steering };
+      return { kind: 'handoff', diagnosis, context, question, summary: say(diagnosis), exclude, restrict: [], steering };
     }
-    return { kind: 'improvise', diagnosis, context, question, summary, exclude, steering };
+    return { kind: 'improvise', diagnosis, context, question, summary: say(diagnosis), exclude, restrict: [], steering };
+  }
+
+  /**
+   * Which of the untried tactics Jev reads the loop as. A set of one is not a question, so the
+   * last one left is taken without spending a call on it; a diagnosis that fails or comes back
+   * unsure is not worth failing the recovery over, because the subtractive fallback still moves.
+   */
+  private async chooseTactic(step: number): Promise<Tactic | undefined> {
+    const candidates = availableTactics(this.triedTactics, ACTION_TOOLS);
+    if (candidates.length <= 1) return candidates[0];
+    try {
+      const answer = await this.decider.diagnoseLoop(await this.buildContext(step), candidates);
+      this.budget.jevCalls += 1;
+      this.options.onEvent({ type: 'budget', budget: { ...this.budget } });
+      if (!answer || answer.confidence < MIN_TACTIC_CONFIDENCE) return undefined;
+      return tactic(answer.id);
+    } catch (error) {
+      // A diagnosis that does not come back is not worth failing a recovery over — the subtractive
+      // fallback still moves the run. But it must not fail silently: on a provider whose head
+      // budget the question does not fit (Laya says so in a 400, see docs/deciders.md), every
+      // recovery would quietly pay a doomed round trip and the ladder would look broken. Said once.
+      if (!this.diagnosisFailed) {
+        this.diagnosisFailed = true;
+        this.options.onEvent({
+          type: 'notice',
+          level: 'info',
+          message: `Could not ask what the loop is (${(error as Error).message}) — withholding what stopped working instead.`,
+        });
+      }
+      return undefined;
+    }
   }
 
   private applyRecovery(plan: RecoveryPlan): void {
@@ -798,6 +909,7 @@ export class Agent {
     for (const name of plan.exclude) {
       this.excludedTools.add(name);
     }
+    this.restrictTo = [...plan.restrict];
     this.steering = [...plan.steering];
     // A recovery is a fresh look: the notes so far are what produced the loop, so they are demoted
     // to a fact in the steering rather than the executor's running summary.
@@ -846,7 +958,11 @@ export class Agent {
       stuckThreshold: config.agent.stuckThreshold,
       dynamicOptions: await this.dynamicOptions(goal),
       steering: this.steering,
-      excludeTools: [...this.excludedTools],
+      // A tactic overrides the standing exclusions rather than adding to them: it is a different
+      // approach, so a tool an earlier rung gave up on is back on the table if this one needs it.
+      excludeTools: this.restrictTo.length
+        ? ACTION_TOOLS.map((entry) => entry.name).filter((name) => !this.restrictTo.includes(name))
+        : [...this.excludedTools],
       criteria: this.ledger.criteria.map(({ id, text, evidence }) => ({ id, text, ...(evidence ? { proven: true } : {}) })),
       autoApprove: config.agent.autoApprove,
       freshLines: this.freshLines,

@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { DEFAULT_CONFIG } from '../src/config.js';
 import { SessionLog } from '../src/core/session-log.js';
-import type { JevClient } from '../src/core/jev.js';
+import type { DecisionModel } from '../src/core/decision.js';
 import type { LlmClient } from '../src/core/llm.js';
 import type { SystemOneResponse } from '../src/types.js';
 
@@ -40,7 +40,7 @@ test('the transcript is private to the user', () => {
 test('jev calls log the request before the response, correlated by call id', async () => {
   const log = new SessionLog(scratch());
   const response: SystemOneResponse = { model: 'jev', answers: {} };
-  const jev = log.wrapJev({ label: 'jev', ask: async () => response } satisfies JevClient);
+  const jev = log.wrapDecider({ label: 'jev', provider: 'typesafe', ask: async () => response } satisfies DecisionModel);
 
   await jev.ask({ goal: 'x' }, { next: { type: 'noul', instructions: 'q' } });
 
@@ -101,7 +101,7 @@ test('credentials never reach the file', () => {
   const config = structuredClone(DEFAULT_CONFIG);
   config.llm.apiKey = 'sk-llm-super-secret-key';
   config.llm.headers = { Authorization: 'Bearer very-secret-gateway-token' };
-  config.jev.apiKey = 'ts-jev-super-secret-key';
+  config.decider.apiKey = 'ts-jev-super-secret-key';
   log.start({ version: '0', config, jevLabel: 'jev', llmLabel: 'llm' });
 
   const text = readFileSync(log.path, 'utf8');

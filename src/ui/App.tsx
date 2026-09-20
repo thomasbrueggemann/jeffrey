@@ -20,6 +20,8 @@ export interface AppProps {
   version: string;
   llmLabel: string;
   jevLabel: string;
+  /** Short name of the decision model in use, e.g. JEV or LAYA. */
+  deciderName: string;
   maxSteps: number;
   explain: boolean;
   /** Start this goal as soon as the TUI mounts, as if it had been typed. */
@@ -31,10 +33,10 @@ export interface AppProps {
 
 const PHASE_LABEL: Record<string, string> = {
   idle: 'ready',
-  deciding: 'asking Jev what to do next',
+  deciding: 'asking the decider what to do next',
   planning: 'executor filling in arguments',
   executing: 'running tool',
-  verifying: 'asking Jev whether the goal is met',
+  verifying: 'asking the decider whether the goal is met',
   approving: 'waiting for approval',
 };
 
@@ -191,7 +193,9 @@ export function App(props: AppProps) {
         version={props.version}
       />
 
-      {state.blocks.length === 0 && !live ? <Welcome explain={props.explain} /> : null}
+      {state.blocks.length === 0 && !live ? (
+        <Welcome explain={props.explain} deciderName={props.deciderName} />
+      ) : null}
 
       <Static items={state.blocks}>
         {(block) => (
@@ -294,15 +298,15 @@ export function App(props: AppProps) {
   );
 }
 
-function Welcome({ explain }: { explain: boolean }) {
+function Welcome({ explain, deciderName }: { explain: boolean; deciderName: string }) {
   return (
     <Box flexDirection="column" paddingX={1} marginBottom={1}>
       <Text color={theme.muted}>
-        Two models, one loop: <Text color={theme.jev}>Jev</Text> decides the next action, the{' '}
+        Two models, one loop: <Text color={theme.jev}>{deciderName}</Text> decides the next action, the{' '}
         <Text color={theme.llm}>executor LLM</Text> writes the code.
       </Text>
       <Text color={theme.dim}>
-        every step Jev answers: which tool, whether the goal is reached, how far along, whether we are stuck.
+        every step it answers: which tool, whether the goal is reached, how far along, whether we are stuck.
       </Text>
       {!explain ? <Text color={theme.dim}>run with --explain to show full probability legends.</Text> : null}
     </Box>

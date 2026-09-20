@@ -1,6 +1,7 @@
 import type { SystemOneResponse, JevDecision, DecisionRoute, Question } from '../types.js';
-import { asChoice, asNoul, asScore, choice, noul, score, type JevClient } from './jev.js';
+import { asChoice, asNoul, asScore, choice, noul, score, type DecisionModel } from './decision.js';
 import type { ToolSpec } from './tools.js';
+import { LOOP_CAUSE_QUESTION, type Tactic } from './recovery.js';
 import { STEP_INTENTS } from './executor.js';
 import type { LedgerView } from './ledger.js';
 
@@ -116,7 +117,7 @@ const RISK_LEVELS = [
 ];
 
 /**
- * The decider. It asks Jev one batch of atomic questions per step and turns the answers into a
+ * The decider. It asks the decision model one batch of atomic questions per step and turns the answers into a
  * routing decision.
  *
  * All questions ride in a single request: System One evaluates them in parallel and in isolation,
@@ -124,7 +125,7 @@ const RISK_LEVELS = [
  */
 export class Decider {
   constructor(
-    private readonly client: JevClient,
+    private readonly client: DecisionModel,
     private readonly maxArgOptions = 12,
   ) {}
 
@@ -276,6 +277,34 @@ export class Decider {
       ...(intent && intent in STEP_INTENTS ? { intent } : {}),
       shortlist: candidates,
     };
+  }
+
+  /**
+   * Ask which of a closed set of causes explains the loop, once `stuck` has fired.
+   *
+   * It is a second request rather than another question on the routing call: the loop is only
+   * known about after that call has answered, and asking every step what is wrong with a step that
+   * is going fine buys nothing. The state is the one the routing call just sent, unchanged, so the
+   * expensive part of the request is a prefix the server has already cached.
+   *
+   * The caller decides which causes are still worth offering, and does not ask at all when only
+   * one is left: a set of one is not a question.
+   */
+  async diagnoseLoop(
+    ctx: DeciderContext,
+    tactics: readonly Tactic[],
+  ): Promise<{ id: string; confidence: number } | undefined> {
+    const options: Record<string, string | null> = {};
+    for (const candidate of tactics) options[candidate.id] = candidate.cause;
+
+    const response = await this.client.ask(buildState(ctx), {
+      loop_cause: choice(LOOP_CAUSE_QUESTION, options),
+    });
+    const answer = asChoice(response.answers['loop_cause']);
+    // A cause outside the set is the same hallucination `next_action` can produce, and means the
+    // model had no reading of the loop: the caller falls back to withholding what did not work.
+    if (!answer || !tactics.some((candidate) => candidate.id === answer.choice)) return undefined;
+    return { id: answer.choice, confidence: answer.confidence };
   }
 
   private interpret(ctx: DeciderContext, response: SystemOneResponse, shortlist: string[]): JevDecision {

@@ -2,20 +2,22 @@
 
 A coding-agent CLI that splits the work between two models:
 
-- Jev ([TypeSafe System One](https://docs.typesafe.ai/introduction)) decides. It never writes prose
-  or code; it only answers closed questions. On every step it picks the next tool, scores how much
-  progress was made, estimates risk, and says whether the goal is reached.
+- A **decision model** decides. It never writes prose or code; it only answers closed questions. On
+  every step it picks the next tool, scores how much progress was made, estimates risk, and says
+  whether the goal is reached. Jev ([TypeSafe System One](https://docs.typesafe.ai/introduction))
+  is the default; [Laya](https://github.com/NandhaKishorM/laya), which you host yourself, is the
+  other one shipped — see [docs/deciders.md](docs/deciders.md).
 - Your LLM (any OpenAI-compatible server, local by default) executes. It fills in the tool
-  arguments, which is where the actual code comes from, for whatever tool Jev chose.
+  arguments, which is where the actual code comes from, for whatever tool the decider chose.
 
-The loop is `Jev → tool → Jev → tool → …` until Jev scores the goal as reached, or escalates.
+The loop is `decide → tool → decide → tool → …` until the goal is scored as reached, or escalates.
 
 ```
             goal
              │
              ▼
-   ┌───────────────────┐   questions: which tool? relevant? scores
-   │   Jev (System One)│◀──────────────────────────────────────────┐
+   ┌───────────────────┐   questions: which tool? which file? scores
+   │ Decider (Jev/Laya)│◀──────────────────────────────────────────┐
    └─────────┬─────────┘                                          │
              │ tool + confidence + risk + progress                │
              ▼                                                    │
@@ -40,7 +42,7 @@ Requires Node >= 22 (Ink 7).
 
 ## Configure
 
-Point it at your local model and give it a TypeSafe key:
+Point it at your local model and give it a decision model:
 
 ```bash
 jeffrey --init                     # writes ~/.jeffrey/config.json
@@ -60,9 +62,10 @@ jeffrey --init                     # writes ~/.jeffrey/config.json
     "thinkingAllowance": 2048,               // with quickExtraBody: a thinking attempt's room
     "executorThinking": "jev"                // when the executor thinks: always | after-failure | jev
   },
-  "jev": {
+  "decider": {
+    "provider": "typesafe",                  // typesafe (Jev) | laya (self-hosted) | mock
     "url": "https://api.typesafe.ai/v1/systemone",
-    "apiKey": "",                            // or export TYPESAFE_API_KEY
+    "apiKey": "",                            // or export TYPESAFE_API_KEY; laya needs none
     "model": "jev-latest"
   },
   "agent": { "maxSteps": 24, "maxRecoveries": 3, "autoApprove": false }
@@ -74,8 +77,11 @@ Config is layered, later wins:
 `defaults` → `~/.jeffrey/config.json` → `./jeffrey.config.json` → environment → CLI flags.
 
 Environment variables: `JEFFREY_LLM_BASE_URL`, `JEFFREY_LLM_API_KEY`, `JEFFREY_LLM_MODEL`,
-`TYPESAFE_API_KEY` (or `JEFFREY_JEV_API_KEY`), `JEFFREY_MAX_STEPS`, `JEFFREY_MAX_RECOVERIES`,
-`JEFFREY_AUTO_APPROVE`.
+`JEFFREY_DECIDER`, `JEFFREY_DECIDER_URL`, `JEFFREY_DECIDER_MODEL`, `TYPESAFE_API_KEY` (or
+`JEFFREY_JEV_API_KEY`), `JEFFREY_MAX_STEPS`, `JEFFREY_MAX_RECOVERIES`, `JEFFREY_AUTO_APPROVE`.
+
+The `decider` section used to be called `jev`, and that name is still read. Switching provider is
+one flag — each brings its own endpoint and model name — and the self-hosted one is set up below.
 
 A thinking model (Qwen3) thinks before every answer, and the thinking counts against `maxTokens`.
 Give the executor room (`"maxTokens": 32768` is fine for a local model), and switch thinking off
@@ -104,11 +110,61 @@ command is detected (npm/pnpm/yarn/bun, cargo, go, pytest/unittest, maven, gradl
 parse checks and import lookup are tables in [src/core/languages.ts](src/core/languages.ts); a language
 that is not in them gets no guesses, only the language-neutral agent.
 
+### Running Laya, the self-hosted decider
+
+Jev is a hosted API and needs a key. [Laya](https://github.com/NandhaKishorM/laya) is Apache 2.0
+and runs on your machine: same three question types, same response shape, no key and no network.
+It ships as a Python package with no server, so this repo carries one —
+[sidecar/laya-server.py](sidecar/laya-server.py), standard library only, exposing the single
+endpoint jeffrey speaks.
+
+```bash
+# terminal 1 — the decider. First run downloads the checkpoint (~1 GB), later runs start in seconds.
+uv run --python 3.12 --with laya --with torch sidecar/laya-server.py --preload typed-decisions
+```
+
+It prints its endpoint when it is up, and you can check it:
+
+```bash
+curl http://127.0.0.1:8137/healthz     # {"ok": true, "laya": "0.3.4", "loaded": ["typed-decisions"]}
+```
+
+```bash
+# terminal 2 — the agent, routed by Laya instead of Jev
+jeffrey --decider laya "fix the failing test in src/parse.py"
+```
+
+Use `--python 3.12` unless your default Python has PyTorch wheels; with `laya` and `torch` already
+installed, `python3 sidecar/laya-server.py --preload typed-decisions` is the same thing. Stop the
+server with ctrl-c, or `pkill -f laya-server.py`.
+
+`--preload` matters: without it a cold checkpoint build costs seconds on the first request of each
+language, and the default keeps only one model resident.
+
+| Server flag | Meaning |
+| --- | --- |
+| `--port <n>` | Default 8137. Match it in `decider.url` or `--jev-url`. |
+| `--preload [names…]` | Build checkpoints at startup: all of them, or the ones named |
+| `--default-model <name>` | Checkpoint for English states: `english`, `multilingual`, `typed-decisions` (default) |
+| `--device <cpu\|cuda\|mps>` | Laya picks one otherwise |
+| `--max-len <n>`, `--head-max-len <n>` | Tokens per question, and the share its options get |
+| `--api-key <key>` | Require a bearer token, for a server on a shared host |
+
+To make it the default, put it in the config instead of passing the flag:
+
+```jsonc
+"decider": { "provider": "laya", "model": "router" }
+```
+
+What Laya trades against Jev — a 512–1024 token context against jeffrey's larger state, a
+different confidence scale — and how to add a third provider:
+[docs/deciders.md](docs/deciders.md).
+
 To see what the layering resolved to:
 
 ```bash
 jeffrey --show-config     # effective config, secrets redacted
-jeffrey --list-models     # System One models available to your key
+jeffrey --list-models     # models the chosen decider offers
 ```
 
 ## Use
@@ -158,21 +214,42 @@ than a reason to stop. When `stuck` crosses the escalation bar the loop improvis
    ran 4 of the last 4, and it keeps choosing write_file instead of acting on it, while the goal score
    stayed at 4% (progress 1.8/4)." The sentence is kept short because it is rendered inside the TUI's
    notice box and again in the final block, and a diagnosis clipped mid-sentence is useless.
-2. Withhold the tool. The moves that are not working are removed from the shortlist, both from
-   the list Jev is offered and from the state description, so a confident model cannot pick them
-   again. Asking politely does not survive a confident model. Re-selecting a tool is itself a signal:
-   a tool Jev keeps choosing but never gets to run leaves no trace in the step history, so it is
-   tracked separately and withheld too; otherwise each round would withhold the same name and the
-   ladder would not move.
-3. Escalate steering. A directive is added to the state: avoid what already failed, try another
-   tool, and make the next call different in kind. From the second round the state also carries the
-   verbatim outcomes so far, and from the third it restates the goal and asks for the actual
-   deliverable.
-4. Re-ask. Jev decides again, with history intact.
+2. Ask what the loop is. A loop is usually a wrong approach rather than a wrong tool, so the agent
+   asks Jev one more closed-set question — which of these causes explains it? The options are in
+   `src/core/recovery.ts`, each one a statement about the state rather than advice:
 
-A re-ask costs one Jev call and zero steps; recoveries never consume the step budget. The ladder
-escalates on each attempt (each round withholds more, and the steering gets blunter) and is bounded
-by `--max-recoveries` (default 3, `JEFFREY_MAX_RECOVERIES`).
+   | Cause Jev picks | What the agent then tries |
+   | --- | --- |
+   | Nothing has actually been executed | `run_shell` — run the tests or the build and read the real output |
+   | The code that has to change has not been found | `grep`, `glob`, `list_dir` — search the workspace instead of reopening what is open |
+   | Enough has been read; the change was never written | `write_file`, `edit_file` — produce the deliverable |
+   | The change is too big to land in one step | `edit_file`, `write_file` — do the smallest part that stands on its own |
+   | The loop is a missing fact only you have | hand it to you, now rather than after two more rungs |
+
+   The question rides on the state the routing call just sent, unchanged, so the server's block
+   cache serves most of it; the extra call costs one round trip and close to nothing in tokens.
+3. Restrict the choice set to that approach. The tactic's tools are the *only* ones on the next
+   decision, in the list Jev is offered and in the state description alike — asking politely does
+   not survive a confident model. The restriction lasts exactly one decision, and it overrides the
+   standing exclusions: a different approach may need a tool an earlier rung gave up on.
+
+   A tactic is spent once per run. The next recovery chooses between the causes that are left, so a
+   loop that survives one approach gets a different one, never a louder version of the same.
+4. Escalate steering. The tactic's instruction goes into the state as a fact. From the second round
+   the state also carries the verbatim outcomes so far, and from the third it restates the goal and
+   asks for the actual deliverable.
+5. Re-ask. Jev decides again, with history intact.
+
+If Jev has no reading of the loop — an unsure answer, or every cause already tried — the ladder
+falls back to the subtractive version: withhold the moves that are not working and say so. That
+proposes nothing, but it keeps the run moving. Re-selecting a tool is itself a signal there: a tool
+Jev keeps choosing but never gets to run leaves no trace in the step history, so it is tracked
+separately and withheld too; otherwise each round would withhold the same name and the ladder would
+not move.
+
+A re-ask costs Jev calls and zero steps; recoveries never consume the step budget. The ladder
+escalates on each attempt and is bounded by `--max-recoveries` (default 3,
+`JEFFREY_MAX_RECOVERIES`).
 
 If the ladder is exhausted and Jev still cannot make progress, jeffrey stops improvising and hands
 back to you: the approval box names what was tried and why it stalled, states the question on its
@@ -220,13 +297,16 @@ jeffrey --jev-mock --llm-mock --print --yes "add a farewell helper"
   jeffrey --print --llm-mock --jev-mock-script '{"tools":["read_file","read_file","read_file","read_file","read_file","read_file","read_file","read_file","read_file","read_file","read_file","read_file","read_file","read_file","read_file","read_file"],"stuck":0.91,"stuckFromStep":4}' "check whether src exists and report back"
   ```
 
-  It loops on `read_file` for four steps, then escalates: each round withholds one more tool
-  (`write_file`, then `edit_file`, `list_dir`, `glob`) and ends by handing the loop to you.
+  It loops on `read_file` for four steps, then escalates: each round is restricted to a different
+  approach (`run_shell`, then the search tools, then the writing ones), and when those are spent it
+  hands the loop to you. Add `"loopCauseConfidence":0.1` to see the subtractive fallback instead.
 
   Knobs: `tools` (one tool per routing call, in order), `confidence`, `stuck`, `stuckFromStep`,
   `stuckUntilCall` (stop reporting `stuck` from this call on, so the agent can be seen breaking out
-  of a loop rather than only handing off), `needsUser`, `finalGoalReached`, `hallucinations` (map of
-  routing call → bogus tool name) and `hallucinateFallback`.
+  of a loop rather than only handing off), `loopCauses` (the causes to read, one per recovery — by
+  default the first one still on offer), `loopCauseConfidence` (drop it below 0.35 to exercise the
+  subtractive fallback), `needsUser`, `finalGoalReached`, `hallucinations` (map of routing call →
+  bogus tool name) and `hallucinateFallback`.
 
 - `--llm-mock` replaces the executor with one that emits a valid call for whatever tool Jev chose,
   synthesising arguments from the tool schema and passing Jev's settled arguments straight through.
@@ -241,7 +321,8 @@ jeffrey --jev-mock --llm-mock --print --yes "add a farewell helper"
 | `--base-url`, `--api-key`, `--model`, `--temperature`, `--max-tokens` | Executor LLM |
 | `--tool-mode forced\|prompt` | Native tool calls (default) or a JSON-argument fallback |
 | `--no-narrate` | Skip the executor's one-line report after each tool |
-| `--jev-url`, `--jev-key`, `--jev-model` | Decider |
+| `--decider <provider>` | Which decision model routes: `typesafe`, `laya`, `mock` |
+| `--jev-url`, `--jev-key`, `--jev-model` | Endpoint, key and model for that provider |
 | `-C, --cwd <dir>` | Workspace root (default: cwd) |
 | `--config <path>` | Explicit config file (replaces the default lookup) |
 | `--max-steps <n>` | Step ceiling, default 24 |
@@ -268,6 +349,10 @@ more of them costs little; asking them in a second request would cost the whole 
 | `target_path`, `target_command` | choice | The file or command the next action works on |
 | `needs_thinking` | noul | Does this step take careful reasoning? (`executorThinking: "jev"`) |
 | `risk` | score | 0 to 4: how hard is this to reverse. Only when approvals are on |
+
+One question is asked on its own, because it only means anything once the answers above are in:
+`loop_cause` (choice) — which of the untried causes explains the loop, after `stuck` has fired. It
+re-sends the state the routing call just sent, so the server's cache carries most of it.
 
 When Jev settles every argument a call needs, the call runs without asking the executor at all: a
 `read_file` of a file Jev picked, or the project's test command.
@@ -329,13 +414,13 @@ Method, metrics and caveats: [bench/README.md](bench/README.md). Results:
 ```
 src/cli.tsx          arg parsing, config layering, headless printer, Ink bootstrap
 src/config.ts        config schema, defaults, file + env loading, redaction
-src/types.ts         Jev primitives, decisions, events, budget
-src/core/jev.ts      System One client: noul / choice / score questions, retries
+src/types.ts         decision primitives, decisions, events, budget
+src/core/decision.ts the decision-model interface: noul / choice / score questions
+src/core/deciders/*  the providers: typesafe (Jev), laya (self-hosted), mock
 src/core/decider.ts  question composition and answer interpretation
 src/core/ledger.ts   the trajectory: criteria, changes, verifications, failures, facts
 src/core/agent.ts    the loop: gate, plan arguments, approve, execute, narrate
 src/core/tools.ts    tool registry, schemas, execution, diffs
 src/core/llm.ts      OpenAI-compatible streaming client + offline mock
-src/core/mock-jev.ts offline scripted decider
 src/ui/*             Ink components, view reducer, theme
 ```

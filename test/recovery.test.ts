@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULT_CONFIG, type Config } from '../src/config.js';
 import { Agent } from '../src/core/agent.js';
-import { MockJevClient, type MockScript } from '../src/core/mock-jev.js';
+import { MockDecider, type MockScript } from '../src/core/deciders/mock.js';
 import { MockLlmClient } from '../src/core/llm.js';
 import type { AgentEvent, ApprovalChoice, ApprovalRequest, ApprovalResponse, DoneReason } from '../src/types.js';
 
@@ -46,11 +46,20 @@ async function run(
   approve: ApprovalChoice | ((request: ApprovalRequest) => ApprovalResponse) = 'allow',
   agent: Partial<Config['agent']> = {},
 ): Promise<RunResult> {
+  return runWith(new MockDecider(script), goal, approve, agent);
+}
+
+/** The same run, driven by a decider the test built itself — one that fails a question, say. */
+async function runWith(
+  jev: MockDecider,
+  goal = 'fix the off-by-one in src/index.ts',
+  approve: ApprovalChoice | ((request: ApprovalRequest) => ApprovalResponse) = 'allow',
+  agent: Partial<Config['agent']> = {},
+): Promise<RunResult> {
   const config: Config = {
     ...DEFAULT_CONFIG,
     agent: { ...DEFAULT_CONFIG.agent, workspace: await scratchWorkspace(), ...agent },
   };
-  const jev = new MockJevClient(script);
   const events: AgentEvent[] = [];
   const approvals: ApprovalRequest[] = [];
   const instance = new Agent({
@@ -89,7 +98,7 @@ const offeredTools = (state: Record<string, unknown>): string[] =>
 
 test('a loop is improvised out of rather than ending the run', async () => {
   // Four identical read_file steps, then Jev calls the loop — and answers "not stuck" on the
-  // re-ask, because the agent withheld the tool and told it what the loop looks like.
+  // re-ask, because the agent restricted the choice set to the approach Jev's own diagnosis named.
   const result = await run({
     tools: ['read_file', 'read_file', 'read_file', 'read_file', 'read_file'],
     // Unsettled, so the executor picks the path: a settled re-read of an unchanged file is skipped outright.
@@ -105,18 +114,20 @@ test('a loop is improvised out of rather than ending the run', async () => {
   const diagnoses = notices(result, 'warn').filter((message) => /reported a loop/.test(message));
   assert.equal(diagnoses.length, 1, `expected one loop diagnosis, got ${JSON.stringify(notices(result))}`);
   assert.match(diagnoses[0]!, /read_file ran 4 of the last 4/);
+  // The notice says what is being tried instead, not only what went wrong.
+  assert.match(diagnoses[0]!, /Trying a different approach — run something and read the real output/);
 
-  // The recovery has to reach Jev as steering, or it is just a log line.
+  // The recovery has to reach Jev as steering, or it is just a log line — and what reaches it is
+  // the instruction the tactic carries, not a generic "stop repeating yourself".
   const steered = result.states.filter((state) => Array.isArray(state.steering) && state.steering.length > 0);
   assert.ok(steered.length >= 1, 'expected the loop diagnosis to be handed back to Jev');
-  assert.match(String(steered[0]!.steering), /Repeating a call that did not move the goal/);
+  assert.match(String(steered[0]!.steering), /Run the project's tests, build, or the program itself/);
 
-  // Withholding the tool is the lever that actually changes the answer, and the payload must not
-  // then advertise the tool it just withheld.
-  assert.ok(
-    result.states.some((state) => !offeredTools(state).includes('read_file')),
-    'expected read_file to be withheld from the choice set after the loop',
-  );
+  // Restricting the choice set is the lever that actually changes the answer: the tactic's tool is
+  // the only one left, and the tool that was looping is not advertised.
+  const restricted = result.states.find((state) => !offeredTools(state).includes('read_file'));
+  assert.ok(restricted, 'expected read_file to be withheld from the choice set after the loop');
+  assert.deepEqual(offeredTools(restricted), ['run_shell'], 'the approach Jev named is the only move on offer');
 
   // A re-ask costs Jev calls, not steps: the run finished inside the step it got stuck on.
   const done = result.events.find((event): event is DoneEvent => event.type === 'done');
@@ -125,13 +136,111 @@ test('a loop is improvised out of rather than ending the run', async () => {
   assert.equal(decisions(result).length, 6, 'one extra decision for the recovery re-ask');
 });
 
+test('each recovery tries a different approach, and a tried one is not offered again', async () => {
+  // The point of asking Jev what the loop is: every rung is a different move, chosen from the
+  // causes not yet spent, rather than the same re-ask with one more tool withheld.
+  const result = await run({ tools: Array(16).fill('read_file'), stuck: 0.91, stuckFromStep: 4 });
+
+  const attempts = notices(result, 'warn')
+    .map((message) => /Trying a different approach — ([^.]+)\./.exec(message)?.[1])
+    .filter((attempt): attempt is string => Boolean(attempt));
+  assert.ok(attempts.length >= 3, `expected several approaches, got ${JSON.stringify(attempts)}`);
+  assert.equal(new Set(attempts).size, attempts.length, `an approach was tried twice: ${JSON.stringify(attempts)}`);
+
+  // Each one has to reach the choice set as a real restriction, and the restrictions must differ.
+  const restrictions = result.states
+    .map((state) => offeredTools(state).join(','))
+    .filter((offered) => offered.length > 0 && offered.split(',').length <= 3);
+  assert.ok(new Set(restrictions).size >= 2, `expected the restricted set to change: ${JSON.stringify(restrictions)}`);
+
+  // And the run has to actually make the moves, not just narrate them.
+  const tools = result.events.filter((event) => event.type === 'tool-call').map((event) => event.tool);
+  assert.ok(tools.includes('run_shell'), `expected the "run it" approach to run: ${JSON.stringify(tools)}`);
+});
+
+test('a restriction lasts one decision, not the rest of the run', async () => {
+  // A tactic that works must not leave the run locked inside one tool. The decision after the
+  // restricted one sees the whole registry again.
+  const result = await run({
+    tools: ['read_file', 'read_file', 'read_file', 'read_file', 'read_file', 'read_file'],
+    leaveArgsToExecutor: true,
+    stuck: 0.91,
+    stuckFromStep: 4,
+    stuckUntilCall: 4,
+  });
+
+  const offered = result.states.map((state) => offeredTools(state)).filter((tools) => tools.length > 0);
+  const restrictedAt = offered.findIndex((tools) => tools.length === 1);
+  assert.ok(restrictedAt >= 0, 'expected one decision restricted to the tactic');
+  const after = offered.slice(restrictedAt + 1);
+  assert.ok(after.length >= 1, 'expected the run to continue past the restricted decision');
+  assert.ok(after.some((tools) => tools.length > 1), 'the restriction must not outlive the decision it shaped');
+});
+
+test('Jev can hand a loop straight to the user when no tool would break it', async () => {
+  // The cause that is not a move: a missing fact only the user has. It spends the rung on the
+  // person who can answer instead of on another tool that cannot.
+  const result = await run(
+    { tools: Array(8).fill('read_file'), stuck: 0.91, stuckFromStep: 4, loopCauses: ['needs-user'] },
+    'fix the off-by-one',
+    'deny',
+  );
+
+  assert.equal(result.reason, 'needs-input', `expected an immediate hand-off, got ${result.summary}`);
+  const handoff = result.approvals.find((request) => request.tool === 'ask_user');
+  assert.ok(handoff, 'expected the loop to be handed to the user');
+  assert.match(String(handoff.reason), /missing fact or decision that no tool can supply/);
+  // It is the first recovery, so nothing has been tried yet and the reason must not claim otherwise.
+  assert.match(String(handoff.reason), /widened the context/);
+});
+
+test('a loop Jev has no reading of falls back to withholding what stopped working', async () => {
+  // A diagnosis it is not sure of decides nothing. The subtractive ladder is what keeps the run
+  // moving then: it proposes nothing, but it never leaves the loop spinning either.
+  const result = await run(
+    { tools: Array(8).fill('read_file'), stuck: 0.91, stuckFromStep: 4, loopCauseConfidence: 0.1 },
+  );
+
+  const diagnoses = notices(result, 'warn').filter((message) => /reported a loop/.test(message));
+  assert.ok(diagnoses.length >= 1);
+  assert.ok(
+    diagnoses.every((message) => !/Trying a different approach/.test(message)),
+    `an unsure diagnosis must not be acted on: ${JSON.stringify(diagnoses)}`,
+  );
+  const steered = result.states.map((state) => String(state.steering ?? '')).join('\n');
+  assert.match(steered, /Repeating a call that did not move the goal/);
+});
+
+test('a decider that cannot answer the diagnosis says so once, then falls back', async () => {
+  // Laya rejects a choice whose options exceed its head budget with a 400 (docs/deciders.md). The
+  // ladder has to survive that, and the user has to learn why the approaches stopped appearing —
+  // but once, not on every rung.
+  const failing = new MockDecider({ tools: Array(12).fill('read_file'), stuck: 0.91, stuckFromStep: 4 });
+  const ask = failing.ask.bind(failing);
+  failing.ask = async (state, questions) => {
+    if ('loop_cause' in questions) throw new Error('options exceed head_max_len — raise --head-max-len');
+    return ask(state, questions);
+  };
+
+  const result = await runWith(failing);
+
+  const complaints = notices(result, 'info').filter((message) => /Could not ask what the loop is/.test(message));
+  assert.equal(complaints.length, 1, `expected the failure to be reported once, got ${JSON.stringify(complaints)}`);
+  assert.match(complaints[0]!, /head_max_len/, 'the provider should say what is wrong in its own words');
+
+  // And the run keeps going on the fallback rather than dying on a failed diagnosis.
+  assert.ok(notices(result, 'warn').some((message) => /reported a loop/.test(message)));
+  assert.notEqual(result.reason, 'error', `a failed diagnosis must not end the run: ${result.summary}`);
+});
+
 test('a persistent loop hands off to the user instead of failing', async () => {
-  // Jev never stops reporting the loop, so the ladder runs out: improvise, hand off, stop — with
-  // the user in the loop rather than a red "failed".
+  // Jev never stops reporting the loop and has no reading of why, so the ladder runs out:
+  // improvise, hand off, stop — with the user in the loop rather than a red "failed".
   const result = await run({
     tools: Array(16).fill('read_file'),
     stuck: 0.91,
     stuckFromStep: 4,
+    loopCauseConfidence: 0.1,
   });
 
   assert.equal(result.reason, 'needs-input', `expected a hand-off, got ${result.summary}`);
@@ -147,11 +256,18 @@ test('a persistent loop hands off to the user instead of failing', async () => {
   assert.match(result.summary, /What should I do differently\?/);
 });
 
-test('each round of the ladder withholds something new', async () => {
-  // The tool Jev keeps re-selecting never executes, so it leaves no history entry. Ranking only on
-  // what ran would withhold read_file again on every round and repeat the same improvise. Ranking
-  // on re-selections too is what makes the ladder walk down the tool list instead.
-  const result = await run({ tools: Array(16).fill('read_file'), stuck: 0.91, stuckFromStep: 4, leaveArgsToExecutor: true });
+test('each round of the fallback ladder withholds something new', async () => {
+  // With no reading of the loop to act on, the ladder is subtractive again. The tool Jev keeps
+  // re-selecting never executes, so it leaves no history entry. Ranking only on what ran would
+  // withhold read_file again on every round and repeat the same improvise. Ranking on
+  // re-selections too is what makes the ladder walk down the tool list instead.
+  const result = await run({
+    tools: Array(16).fill('read_file'),
+    stuck: 0.91,
+    stuckFromStep: 4,
+    leaveArgsToExecutor: true,
+    loopCauseConfidence: 0.1,
+  });
 
   assert.equal(result.reason, 'needs-input', `expected a hand-off, got ${result.summary}`);
 
@@ -265,7 +381,7 @@ test('the answer to a question reaches Jev instead of being discarded', async ()
   // The hand-off asked "What should I do differently?" and the only thing the UI could send back was
   // allow/deny — the typed answer was dropped. It must arrive as steering on the next decision.
   const result = await run(
-    { tools: Array(16).fill('read_file'), stuck: 0.91, stuckFromStep: 4 },
+    { tools: Array(16).fill('read_file'), stuck: 0.91, stuckFromStep: 4, loopCauseConfidence: 0.1 },
     'fix the off-by-one',
     (request) => ({ choice: 'allow', answer: 'stop reading and write the test first' }),
   );

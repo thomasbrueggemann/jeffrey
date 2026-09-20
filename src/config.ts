@@ -1,6 +1,7 @@
 import { readFileSync, existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { PROVIDERS, isProvider } from './core/deciders/index.js';
 
 export interface LlmConfig {
   /** OpenAI-compatible base URL. `http://localhost:11434/v1`, `http://127.0.0.1:8080/v1`, ... */
@@ -57,17 +58,34 @@ export interface LlmConfig {
   extraBody?: Record<string, unknown>;
 }
 
-export interface JevConfig {
-  /** Full endpoint, not a base URL: the System One endpoint is a single POST target. */
+/**
+ * Which decision model routes the loop. `typesafe` is Jev, the hosted System One API; `laya` is
+ * the Apache-2.0 model you host yourself through `sidecar/laya-server.py`; `mock` is the scripted
+ * stand-in. The providers live in `src/core/deciders/`.
+ */
+export type DeciderProvider = 'typesafe' | 'laya' | 'mock';
+
+export interface DeciderConfig {
+  provider: DeciderProvider;
+  /** Full endpoint, not a base URL: a System One request is a single POST target. */
   url: string;
   apiKey: string;
   model: string;
   timeoutMs: number;
   /** Retries on 429 / 529 / 5xx with exponential backoff. */
   maxRetries: number;
-  /** Use the deterministic offline stand-in instead of the real API. */
+  /** Use the deterministic offline stand-in instead of a real server. */
   mock: boolean;
+  /**
+   * Merged into the request body, for provider-specific switches. The Laya sidecar reads
+   * `head_max_len` and `max_len` from here, which is how a question with many options is given
+   * enough room for its labels.
+   */
+  options?: Record<string, unknown>;
 }
+
+/** The previous name for {@link DeciderConfig}, kept so older configs and imports still resolve. */
+export type JevConfig = DeciderConfig;
 
 export interface AgentConfig {
   workspace: string;
@@ -109,7 +127,7 @@ export interface AgentConfig {
 
 export interface Config {
   llm: LlmConfig;
-  jev: JevConfig;
+  decider: DeciderConfig;
   agent: AgentConfig;
 }
 
@@ -128,7 +146,8 @@ export const DEFAULT_CONFIG: Config = {
     contextChars: 24_000,
     mock: false,
   },
-  jev: {
+  decider: {
+    provider: 'typesafe',
     url: 'https://api.typesafe.ai/v1/systemone',
     apiKey: '',
     model: 'jev-latest',
@@ -156,22 +175,25 @@ export const DEFAULT_CONFIG: Config = {
 
 type DeepPartial<T> = { [K in keyof T]?: Partial<T[K]> };
 
+/** A config layer. `jev` is what the `decider` section used to be called, and is still read. */
+type ConfigLayer = DeepPartial<Config> & { jev?: Partial<DeciderConfig> };
+
 export const GLOBAL_CONFIG_PATH = join(homedir(), '.jeffrey', 'config.json');
 export const SESSIONS_DIR = join(homedir(), '.jeffrey', 'sessions');
 export const PROJECT_CONFIG_NAME = 'jeffrey.config.json';
 
-function readJson(path: string): DeepPartial<Config> | undefined {
+function readJson(path: string): ConfigLayer | undefined {
   if (!existsSync(path)) return undefined;
   try {
-    return JSON.parse(readFileSync(path, 'utf8')) as DeepPartial<Config>;
+    return JSON.parse(readFileSync(path, 'utf8')) as ConfigLayer;
   } catch (error) {
     throw new Error(`Could not parse ${path}: ${(error as Error).message}`);
   }
 }
 
-function fromEnv(env: NodeJS.ProcessEnv): DeepPartial<Config> {
+function fromEnv(env: NodeJS.ProcessEnv): ConfigLayer {
   const llm: Partial<LlmConfig> = {};
-  const jev: Partial<JevConfig> = {};
+  const decider: Partial<DeciderConfig> = {};
   const agent: Partial<AgentConfig> = {};
 
   const str = (value: string | undefined) => (value && value.trim() ? value.trim() : undefined);
@@ -202,14 +224,21 @@ function fromEnv(env: NodeJS.ProcessEnv): DeepPartial<Config> {
   const llmMock = bool(env['JEFFREY_LLM_MOCK']);
   if (llmMock !== undefined) llm.mock = llmMock;
 
-  const jevKey = str(env['TYPESAFE_API_KEY']) ?? str(env['JEFFREY_JEV_API_KEY']);
-  if (jevKey) jev.apiKey = jevKey;
-  const jevUrl = str(env['JEFFREY_JEV_URL']);
-  if (jevUrl) jev.url = jevUrl;
-  const jevModel = str(env['JEFFREY_JEV_MODEL']);
-  if (jevModel) jev.model = jevModel;
-  const jevMock = bool(env['JEFFREY_JEV_MOCK']);
-  if (jevMock !== undefined) jev.mock = jevMock;
+  // The JEFFREY_JEV_* names predate the second provider and still work.
+  const provider = str(env['JEFFREY_DECIDER']) ?? str(env['JEFFREY_DECIDER_PROVIDER']);
+  if (provider) {
+    if (!isProvider(provider)) throw new Error(`Unknown decider provider: ${provider}`);
+    decider.provider = provider;
+  }
+  const deciderKey =
+    str(env['JEFFREY_DECIDER_API_KEY']) ?? str(env['TYPESAFE_API_KEY']) ?? str(env['JEFFREY_JEV_API_KEY']);
+  if (deciderKey) decider.apiKey = deciderKey;
+  const deciderUrl = str(env['JEFFREY_DECIDER_URL']) ?? str(env['JEFFREY_JEV_URL']);
+  if (deciderUrl) decider.url = deciderUrl;
+  const deciderModel = str(env['JEFFREY_DECIDER_MODEL']) ?? str(env['JEFFREY_JEV_MODEL']);
+  if (deciderModel) decider.model = deciderModel;
+  const deciderMock = bool(env['JEFFREY_DECIDER_MOCK']) ?? bool(env['JEFFREY_JEV_MOCK']);
+  if (deciderMock !== undefined) decider.mock = deciderMock;
 
   const maxSteps = num(env['JEFFREY_MAX_STEPS']);
   if (maxSteps !== undefined) agent.maxSteps = maxSteps;
@@ -220,12 +249,14 @@ function fromEnv(env: NodeJS.ProcessEnv): DeepPartial<Config> {
   const saveSessions = bool(env['JEFFREY_SAVE_SESSIONS']);
   if (saveSessions !== undefined) agent.saveSessions = saveSessions;
 
-  return { llm, jev, agent };
+  return { llm, decider, agent };
 }
 
 export interface ConfigOverrides extends DeepPartial<Config> {
   /** Path to an explicit config file, replacing the project/global lookup. */
   configPath?: string;
+  /** Legacy name for `decider`. */
+  jev?: Partial<DeciderConfig>;
 }
 
 export interface LoadedConfig {
@@ -236,7 +267,7 @@ export interface LoadedConfig {
 
 export function loadConfig(overrides: ConfigOverrides = {}, env = process.env): LoadedConfig {
   const sources: string[] = [];
-  const layers: DeepPartial<Config>[] = [DEFAULT_CONFIG as DeepPartial<Config>];
+  const layers: ConfigLayer[] = [DEFAULT_CONFIG as ConfigLayer];
 
   if (overrides.configPath) {
     const explicit = readJson(resolve(overrides.configPath));
@@ -266,13 +297,27 @@ export function loadConfig(overrides: ConfigOverrides = {}, env = process.env): 
 
   const merged: Config = {
     llm: { ...DEFAULT_CONFIG.llm },
-    jev: { ...DEFAULT_CONFIG.jev },
+    decider: { ...DEFAULT_CONFIG.decider },
     agent: { ...DEFAULT_CONFIG.agent },
   };
+  // Which decider values a layer actually named, so switching provider can fill in the rest: a
+  // laya run must not keep pointing at the TypeSafe endpoint just because that is the default.
+  const named = new Set<string>();
   for (const layer of layers) {
     if (layer.llm) Object.assign(merged.llm, layer.llm);
-    if (layer.jev) Object.assign(merged.jev, layer.jev);
+    const decider = { ...(layer.jev ?? {}), ...(layer.decider ?? {}) };
+    if (layer !== layers[0]) for (const key of Object.keys(decider)) named.add(key);
+    Object.assign(merged.decider, decider);
     if (layer.agent) Object.assign(merged.agent, layer.agent);
+  }
+
+  if (!isProvider(merged.decider.provider)) {
+    throw new Error(
+      `Unknown decider provider: ${merged.decider.provider}. Known: ${Object.keys(PROVIDERS).join(', ')}`,
+    );
+  }
+  for (const [key, value] of Object.entries(PROVIDERS[merged.decider.provider].defaults)) {
+    if (!named.has(key)) (merged.decider as unknown as Record<string, unknown>)[key] = value;
   }
 
   merged.agent.workspace = resolve(merged.agent.workspace);

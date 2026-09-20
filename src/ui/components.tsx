@@ -4,6 +4,21 @@ import type { ApprovalRequest, Budget, DoneReason, JevDecision } from '../types.
 import type { Block, StepView } from './view.js';
 import { colorForProbability, formatTokens, glyph, meter, percent, scoreMeter, theme, truncate } from './theme.js';
 
+/*
+ * Which decision model is answering, for the one place it is printed per step. One run has one
+ * decider, so this is set once at startup rather than threaded through every block — the blocks
+ * are rendered from a flat list, and a prop would have to cross all of it to say one word.
+ */
+let currentDecider = 'JEV';
+
+export function setDeciderName(name: string): void {
+  currentDecider = name.toUpperCase();
+}
+
+export function deciderName(): string {
+  return currentDecider;
+}
+
 /* ------------------------------------------------------------------ header */
 
 export function Header({
@@ -78,7 +93,7 @@ export function JevPanel({ decision, explain }: { decision: JevDecision; explain
     <Box flexDirection="column" paddingLeft={2}>
       <Box justifyContent="space-between">
         <Text>
-          <Text color={theme.jev}>{glyph.jev} JEV </Text>
+          <Text color={theme.jev}>{glyph.jev} {deciderName()} </Text>
           <Text color={theme.jev} bold>
             {decision.tool}
           </Text>

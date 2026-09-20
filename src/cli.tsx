@@ -15,11 +15,19 @@ import {
   type ConfigOverrides,
 } from './config.js';
 import { createLlmClient } from './core/llm.js';
-import { TypeSafeClient, listModels, type JevClient } from './core/jev.js';
-import { MockJevClient, type MockScript } from './core/mock-jev.js';
+import type { DecisionModel } from './core/decision.js';
+import {
+  PROVIDERS,
+  createDecisionModel,
+  isProvider,
+  listDecisionModels,
+  MockDecider,
+  type MockScript,
+} from './core/deciders/index.js';
 import { Agent, type ToolMode } from './core/agent.js';
 import { SessionLog } from './core/session-log.js';
 import { App, type Runner } from './ui/App.js';
+import { setDeciderName } from './ui/components.js';
 import type { AgentEvent, ApprovalRequest, ApprovalResponse, Budget, JevDecision } from './types.js';
 
 const VERSION = readVersion();
@@ -34,6 +42,7 @@ interface Flags {
   model?: string;
   temperature?: number;
   maxTokens?: number;
+  decider?: string;
   jevUrl?: string;
   jevKey?: string;
   jevModel?: string;
@@ -57,7 +66,7 @@ interface Flags {
 }
 
 const HELP = `
-  jeffrey — Jev decides, a local LLM writes the code.
+  jeffrey — a decision model decides, a local LLM writes the code.
 
   Usage
     $ jeffrey [goal] [options]
@@ -65,13 +74,19 @@ const HELP = `
     Goal is optional. Without it the TUI opens and you type one; with it the run
     starts immediately. Piping stdin or passing --print runs headless.
 
-  Decider (TypeSafe System One)
-    --jev-url <url>          System One endpoint           [TYPESAFE_API_KEY]
-    --jev-key <key>          API key                       [JEFFREY_JEV_API_KEY]
-    --jev-model <name>       Model name
-    --jev-mock[=a,b,c]       Offline scripted decider, no API key needed
+  Decider (which model picks the next action)
+    --decider <provider>     typesafe (Jev, hosted) | laya (self-hosted) | mock
+                                                           [JEFFREY_DECIDER]
+    --jev-url <url>          Endpoint for the chosen provider  [JEFFREY_DECIDER_URL]
+    --jev-key <key>          API key, when the provider needs one
+                                                           [TYPESAFE_API_KEY]
+    --jev-model <name>       Model name, e.g. jev-latest or, for laya, router
+    --jev-mock[=a,b,c]       Offline scripted decider, no server needed
     --jev-mock-script <json> Full MockScript, e.g. '{"tools":["read_file"],
                              "stuck":0.91,"stuckFromStep":4}' to replay a loop
+
+    Laya runs beside jeffrey, not in it: start sidecar/laya-server.py first.
+    See docs/deciders.md.
 
   Executor (any OpenAI-compatible server)
     --base-url <url>         e.g. http://localhost:11434/v1  [JEFFREY_LLM_BASE_URL]
@@ -90,7 +105,7 @@ const HELP = `
     --max-recoveries <n>     Loop recoveries before handing back to you, default 3
     -y, --yes                Auto-approve every mutating tool
     --dry-run                Deny every mutating tool (also denies in --print mode)
-    --explain                Show probability legends and full Jev reasoning
+    --explain                Show probability legends and the full decision
 
   Output
     --print                  Headless transcript on stdout, no TUI
@@ -104,12 +119,13 @@ const HELP = `
   Setup
     --init                   Write a starter config to ~/.jeffrey/config.json
     --show-config            Print the effective config with secrets redacted
-    --list-models            List System One models available to your key
+    --list-models            List the models the chosen provider offers
     -h, --help
     -v, --version
 
   Config is layered: defaults < ~/.jeffrey/config.json < ./jeffrey.config.json
-  < environment < flags. Keys: llm / jev / agent, same names as the flags.
+  < environment < flags. Keys: llm / decider / agent, same names as the flags.
+  The old section name "jev" is still read.
 `;
 
 function readVersion(): string {
@@ -194,6 +210,10 @@ export function parseArgs(argv: string[]): Flags {
         break;
       case '--max-tokens':
         flags.maxTokens = number(value(flag), flag);
+        break;
+      case '--decider':
+      case '--decider-provider':
+        flags.decider = value(flag);
         break;
       case '--jev-url':
         flags.jevUrl = value(flag);
@@ -299,25 +319,33 @@ function splitOnce(input: string, separator: string): [string, string] {
 export interface Session {
   config: Config;
   jevLabel: string;
+  /** Short name of the decision model in use — JEV, LAYA — for the header and the step panel. */
+  deciderName: string;
   llmLabel: string;
   runner: Runner;
-  mockJev?: MockJevClient;
+  mockJev?: MockDecider;
   /** The transcript for this session, or undefined when `agent.saveSessions` is off. */
   log?: SessionLog;
 }
 
-function jevOverrides(flags: Flags): ConfigOverrides {
-  const jev: ConfigOverrides['jev'] = {};
-  if (flags.jevUrl) jev.url = flags.jevUrl;
-  if (flags.jevKey) jev.apiKey = flags.jevKey;
-  if (flags.jevModel) jev.model = flags.jevModel;
-  if (flags.jevMock || flags.jevMockScript) jev.mock = true;
-  return { jev };
+function deciderOverrides(flags: Flags): ConfigOverrides {
+  const decider: ConfigOverrides['decider'] = {};
+  if (flags.decider) {
+    if (!isProvider(flags.decider)) {
+      fail(`unknown --decider ${flags.decider}. Known: ${Object.keys(PROVIDERS).join(', ')}`);
+    }
+    decider.provider = flags.decider;
+  }
+  if (flags.jevUrl) decider.url = flags.jevUrl;
+  if (flags.jevKey) decider.apiKey = flags.jevKey;
+  if (flags.jevModel) decider.model = flags.jevModel;
+  if (flags.jevMock || flags.jevMockScript) decider.mock = true;
+  return { decider };
 }
 
 /** Every flag that can move a config value, in one place — `--show-config` must not lie about the run. */
 export function configOverrides(flags: Flags): ConfigOverrides {
-  const overrides: ConfigOverrides = jevOverrides(flags);
+  const overrides: ConfigOverrides = deciderOverrides(flags);
   if (flags.configPath) overrides.configPath = flags.configPath;
 
   const llm: ConfigOverrides['llm'] = {};
@@ -346,10 +374,10 @@ export function buildSession(flags: Flags): Session {
 
   const script: MockScript = flags.jevMockScript ?? { tools: flags.jevMock ?? DEFAULT_MOCK_TOOLS };
   const useMock = Boolean(flags.jevMockScript || flags.jevMock);
-  const mockJev = useMock ? new MockJevClient(script) : undefined;
+  const mockJev = useMock ? new MockDecider(script) : undefined;
   const log = config.agent.saveSessions ? new SessionLog() : undefined;
-  const rawJev: JevClient = mockJev ?? new TypeSafeClient(config.jev);
-  const jev = log ? log.wrapJev(rawJev) : rawJev;
+  const rawJev: DecisionModel = mockJev ?? createDecisionModel(config.decider);
+  const jev = log ? log.wrapDecider(rawJev) : rawJev;
   const llmLabel = config.llm.mock
     ? 'mock-executor'
     : `${config.llm.model} · ${config.llm.baseUrl.replace(/^https?:\/\//, '')}`;
@@ -382,7 +410,15 @@ export function buildSession(flags: Flags): Session {
     }
   };
 
-  return { config, jevLabel: jev.label, llmLabel, runner, ...(mockJev ? { mockJev } : {}), ...(log ? { log } : {}) };
+  return {
+    config,
+    jevLabel: jev.label,
+    deciderName: rawJev.provider === 'typesafe' ? 'JEV' : rawJev.provider.toUpperCase(),
+    llmLabel,
+    runner,
+    ...(mockJev ? { mockJev } : {}),
+    ...(log ? { log } : {}),
+  };
 }
 
 /* ------------------------------------------------------------------ headless output */
@@ -526,7 +562,7 @@ export async function main(): Promise<void> {
   }
   if (flags.listModels) {
     const { config } = loadConfig(configOverrides(flags));
-    const models = await listModels(config.jev);
+    const models = await listDecisionModels(config.decider);
     for (const model of models) process.stdout.write(`${model.name}\t${model.release_date}\t${model.description}\n`);
     return;
   }
@@ -537,7 +573,7 @@ export async function main(): Promise<void> {
         {
           sources,
           llm: { ...config.llm, apiKey: redact(config.llm.apiKey) },
-          jev: { ...config.jev, apiKey: redact(config.jev.apiKey) },
+          decider: { ...config.decider, apiKey: redact(config.decider.apiKey) },
           agent: config.agent,
         },
         null,
@@ -547,12 +583,16 @@ export async function main(): Promise<void> {
     return;
   }
 
-  const { config, jevLabel, llmLabel, runner, log } = buildSession(flags);
+  const { config, jevLabel, deciderName, llmLabel, runner, log } = buildSession(flags);
+  setDeciderName(deciderName);
   const headless = flags.print || !process.stdout.isTTY;
 
   if (headless) {
-    if (!config.jev.mock && !config.jev.apiKey) {
-      fail('no TypeSafe API key. Set TYPESAFE_API_KEY, or run with --jev-mock for an offline dry run.');
+    if (!config.decider.mock && PROVIDERS[config.decider.provider].needsApiKey && !config.decider.apiKey) {
+      fail(
+        `no API key for the ${config.decider.provider} decider. Set TYPESAFE_API_KEY, run with ` +
+          '--decider laya for a self-hosted one, or --jev-mock for an offline dry run.',
+      );
     }
     const goal = flags.goal || (await readStdinGoal());
     if (!goal) fail('no goal given. Pass one as an argument, or pipe it on stdin.');
@@ -592,6 +632,7 @@ export async function main(): Promise<void> {
       version={VERSION}
       llmLabel={llmLabel}
       jevLabel={jevLabel}
+      deciderName={deciderName}
       maxSteps={config.agent.maxSteps}
       explain={flags.explain}
       initialGoal={flags.goal || undefined}

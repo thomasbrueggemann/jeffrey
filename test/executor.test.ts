@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULT_CONFIG, type Config } from '../src/config.js';
 import { Agent } from '../src/core/agent.js';
-import { MockJevClient } from '../src/core/mock-jev.js';
+import { MockDecider } from '../src/core/deciders/mock.js';
 import { alignEdit, buildBrief, gatherFiles, validateArgs } from '../src/core/executor.js';
 import { localImports } from '../src/core/languages.js';
 import { ACTION_TOOLS, TOOLS_BY_NAME } from '../src/core/tools.js';
@@ -107,7 +107,7 @@ async function runEdit(llm: ScriptedExecutor): Promise<{ dir: string; events: Ag
     goal: 'fix the add function in src/math.ts, it subtracts',
     config,
     llm,
-    jev: new MockJevClient({ tools: ['edit_file'] }),
+    jev: new MockDecider({ tools: ['edit_file'] }),
     onEvent: (event) => events.push(event),
     approve: async () => 'allow',
   });
@@ -201,7 +201,7 @@ test('the reporter sees the workspace, and a cut-off draft never becomes the not
   const llm = new RamblingReporter([{}]);
   const dir = await workspace();
   await writeFile(join(dir, 'package.json'), JSON.stringify({ scripts: { check: 'node -e "process.exit(3)"' } }));
-  const jev = new MockJevClient({ tools: ['run_shell', 'read_file'] });
+  const jev = new MockDecider({ tools: ['run_shell', 'read_file'] });
   await new Agent({
     goal: 'fix the add function in src/math.ts, it subtracts',
     config: { ...DEFAULT_CONFIG, agent: { ...DEFAULT_CONFIG.agent, workspace: dir, autoApprove: true, maxSteps: 2 } },
@@ -258,7 +258,7 @@ class ProvingExecutor implements LlmClient {
 test('a run ends once every criterion is proven by a quote found in the files', async () => {
   const dir = await workspace();
   const events: AgentEvent[] = [];
-  const jev = new MockJevClient({ tools: ['write_file', 'write_file', 'read_file', 'read_file', 'read_file'], leaveArgsToExecutor: true });
+  const jev = new MockDecider({ tools: ['write_file', 'write_file', 'read_file', 'read_file', 'read_file'], leaveArgsToExecutor: true });
   const { reason, summary } = await new Agent({
     goal: 'write app.js that saves a count and ticks',
     config: { ...DEFAULT_CONFIG, agent: { ...DEFAULT_CONFIG.agent, workspace: dir, autoApprove: true, maxSteps: 6 } },
@@ -287,7 +287,7 @@ test('an absolute path inside the workspace is recorded relative', async () => {
     goal: 'fix the add function in src/math.ts, it subtracts',
     config: { ...DEFAULT_CONFIG, agent: { ...DEFAULT_CONFIG.agent, workspace: dir, autoApprove: true, maxSteps: 1 } },
     llm,
-    jev: new MockJevClient({ tools: ['edit_file'], leaveArgsToExecutor: true }),
+    jev: new MockDecider({ tools: ['edit_file'], leaveArgsToExecutor: true }),
     onEvent: (event) => events.push(event),
     approve: async () => 'allow',
   }).run();
@@ -334,7 +334,7 @@ test('several write_file calls in one reply are written in one step', async () =
     goal: 'make index.html that loads app.js, which greets the user',
     config: { ...DEFAULT_CONFIG, agent: { ...DEFAULT_CONFIG.agent, workspace: dir, autoApprove: true, maxSteps: 3 } },
     llm,
-    jev: new MockJevClient({ tools: ['write_file', 'read_file', 'read_file'], leaveArgsToExecutor: true }),
+    jev: new MockDecider({ tools: ['write_file', 'read_file', 'read_file'], leaveArgsToExecutor: true }),
     onEvent: (event) => events.push(event),
     approve: async () => 'allow',
   }).run();
@@ -386,7 +386,7 @@ test('proven criteria still need the project tests to pass before the run ends',
     goal: 'write app.js with tick and ok',
     config: { ...DEFAULT_CONFIG, agent: { ...DEFAULT_CONFIG.agent, workspace: dir, autoApprove: true, maxSteps: 6 } },
     llm,
-    jev: new MockJevClient({ tools: ['write_file', 'write_file', 'write_file', 'write_file'], leaveArgsToExecutor: true }),
+    jev: new MockDecider({ tools: ['write_file', 'write_file', 'write_file', 'write_file'], leaveArgsToExecutor: true }),
     onEvent: (event) => events.push(event),
     approve: async () => 'allow',
   }).run();
@@ -437,7 +437,7 @@ test('a cut-off reply is retried without thinking first, and only then with a bi
     goal: 'fix the add function in src/math.ts, it subtracts',
     config: { ...DEFAULT_CONFIG, llm: { ...DEFAULT_CONFIG.llm, quickExtraBody, executorThinking: 'always' }, agent: { ...DEFAULT_CONFIG.agent, workspace: dir, autoApprove: true, maxSteps: 1 } },
     llm,
-    jev: new MockJevClient({ tools: ['edit_file'] }),
+    jev: new MockDecider({ tools: ['edit_file'] }),
     onEvent: () => {},
     approve: async () => 'allow',
   }).run();
@@ -495,7 +495,7 @@ test('a first attempt gets a thinking allowance, and the retry without thinking 
       agent: { ...DEFAULT_CONFIG.agent, workspace: dir, autoApprove: true, maxSteps: 1 },
     },
     llm,
-    jev: new MockJevClient({ tools: ['edit_file'] }),
+    jev: new MockDecider({ tools: ['edit_file'] }),
     onEvent: () => {},
     approve: async () => 'allow',
   }).run();
@@ -528,7 +528,7 @@ test('criteria are planned from the files the goal names, not from the goal alon
 test('a call whose every required argument Jev settled runs without asking the executor', async () => {
   const dir = await workspace();
   const llm = new ScriptedExecutor([{}]);
-  const jev = new MockJevClient({ tools: ['read_file'] });
+  const jev = new MockDecider({ tools: ['read_file'] });
   await new Agent({
     goal: 'look at src/math.ts',
     config: { ...DEFAULT_CONFIG, agent: { ...DEFAULT_CONFIG.agent, workspace: dir, autoApprove: true, maxSteps: 1 } },
@@ -558,7 +558,7 @@ test('with executorThinking after-failure, a first attempt skips thinking and a 
       agent: { ...DEFAULT_CONFIG.agent, workspace: dir, autoApprove: true, maxSteps: 1 },
     },
     llm,
-    jev: new MockJevClient({ tools: ['edit_file'] }),
+    jev: new MockDecider({ tools: ['edit_file'] }),
     onEvent: () => {},
     approve: async () => 'allow',
   }).run();
@@ -584,7 +584,7 @@ test('an edit that meets a criterion is proven from Jev\'s pick of the lines it 
   const dir = await workspace();
   // The executor claims nothing; the proof comes from the next routing call.
   const llm = new ScriptedExecutor([{ path: 'src/math.ts', old_string: '  return a - b;', new_string: '  return a + b; // add, never subtract' }]);
-  const jev = new MockJevClient({ tools: ['edit_file', 'list_dir', 'list_dir'] });
+  const jev = new MockDecider({ tools: ['edit_file', 'list_dir', 'list_dir'] });
   await new Agent({
     goal: 'fix the add function in src/math.ts, it subtracts',
     config: { ...DEFAULT_CONFIG, agent: { ...DEFAULT_CONFIG.agent, workspace: dir, autoApprove: true, maxSteps: 3 } },
@@ -621,7 +621,7 @@ test('a reply that calls a tool other than the one asked for is asked again with
     goal: 'fix the add function in src/math.ts, it subtracts',
     config: { ...DEFAULT_CONFIG, agent: { ...DEFAULT_CONFIG.agent, workspace: dir, autoApprove: true, maxSteps: 1 } },
     llm,
-    jev: new MockJevClient({ tools: ['edit_file'] }),
+    jev: new MockDecider({ tools: ['edit_file'] }),
     onEvent: () => {},
     approve: async () => 'allow',
   }).run();

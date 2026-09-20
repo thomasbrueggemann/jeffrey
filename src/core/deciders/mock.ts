@@ -1,12 +1,12 @@
-import type { Answer, Question, SystemOneResponse } from '../types.js';
-import type { JevClient } from './jev.js';
+import type { Answer, Question, SystemOneResponse } from '../../types.js';
+import type { DecisionModel } from '../decision.js';
 
 /**
- * Deterministic stand-in for System One, used by `--jev-mock` and the offline self-test.
+ * Deterministic stand-in for a decision model, used by `--decider-mock` and the offline self-test.
  *
  * It answers the exact questions `Decider` composes, so the whole routing path — relevance
  * screen, tool choice, argument choices, goal scoring — is exercised without an API key.
- * It is a test double, not an approximation of Jev: the point is to prove the plumbing.
+ * It is a test double, not an approximation of any real model: the point is to prove the plumbing.
  */
 export interface MockScript {
   /** Tool names to route to, one per step, in order. */
@@ -32,7 +32,7 @@ export interface MockScript {
   /** Probability reported for `needs_user`, so routing around a low-probability question is testable. */
   needsUser?: number;
   /**
-   * Tool names Jev "names" on a routing call even though they were never offered — the free-form
+   * Tool names the decider "names" on a routing call even though they were never offered — the free-form
    * hallucination the agent's tool-correction path exists for. Keyed by routing call, counting
    * re-asks, and applied to `next_action` only unless `hallucinateFallback` is set.
    */
@@ -46,12 +46,21 @@ export interface MockScript {
   criteriaMet?: number;
   /** Answer every argument question with the "executor decides" escape hatch, settling nothing. */
   leaveArgsToExecutor?: boolean;
+  /**
+   * Loop causes to read, one per diagnosis call, in order. Unset, the first cause still on offer
+   * is chosen — which is already a different one each round, because a spent tactic is withdrawn.
+   */
+  loopCauses?: string[];
+  /** Confidence reported for the loop diagnosis, so the "no reading of the loop" path is testable. */
+  loopCauseConfidence?: number;
 }
 
-export class MockJevClient implements JevClient {
-  readonly label = 'mock-jev';
+export class MockDecider implements DecisionModel {
+  readonly provider = 'mock';
+  readonly label = 'mock-decider';
   readonly seenStates: unknown[] = [];
   private routingCalls = 0;
+  private diagnoses = 0;
 
   constructor(private readonly script: MockScript = { tools: [] }) {}
 
@@ -94,7 +103,7 @@ export class MockJevClient implements JevClient {
             type: 'choice',
             choice: picked,
             probabilities: second ? { [picked]: confidence, [second]: Math.max(0, 1 - confidence) / 2 } : {},
-            confidence,
+            confidence: id === 'loop_cause' ? (this.script.loopCauseConfidence ?? confidence) : confidence,
           };
           break;
         }
@@ -102,7 +111,7 @@ export class MockJevClient implements JevClient {
     }
 
     return {
-      model: 'mock-jev-0.0.0',
+      model: 'mock-decider-0.0.0',
       answers,
       usage: { input_tokens: 400, output_tokens: 60 },
     };
@@ -162,6 +171,13 @@ export class MockJevClient implements JevClient {
       return preferred ?? options[0] ?? '';
     }
     if (id === 'step_intent') return intentFor(planned, step) ?? options[0] ?? '';
+    if (id === 'loop_cause') {
+      // The scripted reading, or the first cause still on offer — which already differs each
+      // round, because the agent withdraws a cause once it has been tried.
+      const scripted = this.script.loopCauses?.[this.diagnoses];
+      this.diagnoses += 1;
+      return scripted ?? options[0] ?? '';
+    }
     // Argument questions: take the first real option, skipping the "executor decides" escape hatch.
     const escape = options.find((option) => option.startsWith('the executor should decide'));
     if (this.script.leaveArgsToExecutor && escape) return escape;
