@@ -302,7 +302,10 @@ const editFileTool: ToolSpec = {
     'Copy old_string character-for-character from the current file contents shown: same indentation, same line breaks, no line numbers.',
     'Include two or three unchanged neighbouring lines in old_string so it occurs exactly once.',
     'new_string replaces the whole of old_string, so repeat those neighbouring lines in it unchanged.',
+    'When the step needs several separate changes, make one edit_file call per change in this same reply, each with its own old_string.',
   ],
+  /** Several calls in one reply run in the same step: one brief pays for the whole change. */
+  batchable: true,
   risk: 0.5,
   mutates: true,
   async execute(args, ctx) {

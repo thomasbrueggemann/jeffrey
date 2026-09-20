@@ -53,6 +53,12 @@ const MAX_TOOL_CORRECTIONS = 2;
 /** Executor calls rejected by `validateArgs` get this many second chances before the step fails. */
 const MAX_ARG_REPAIRS = 2;
 /**
+ * How sure Jev has to be that a step needs reasoning before the executor thinks. Thinking is most of
+ * the executor's generation, and generation is most of the wall time; a maybe is not worth it, and a
+ * call it gets wrong without thinking is retried with it.
+ */
+const THINK_THRESHOLD = 0.5;
+/**
  * A reply cut off at `max_tokens` is not a bad answer, it is an unfinished one: asking again with the
  * same budget just burns another full generation (a whole-file write_file at 4096 tokens never fits).
  * So each truncated call doubles the budget, up to this ceiling.
@@ -72,11 +78,19 @@ function goalNames(goal: string, path: string): boolean {
  * Roughly how many tokens a call's answer itself needs: a whole file for write_file (the current
  * one's size, or room for a few new ones), an excerpt for edit_file, a line for the rest.
  */
-function answerEstimate(tool: ToolSpec, files: FileContext[]): number {
+function answerEstimate(tool: ToolSpec, files: FileContext[], target?: string): number {
   if (tool.name === 'write_file') {
-    const current = files.find((file) => file.exists && !file.importedBy);
-    return current ? 2048 + Math.ceil(current.content.length / 3) : 8192;
+    // The file this call rewrites, not whichever file happens to be shown first: sized from the
+    // wrong one, a rewrite of a longer file is cut off mid-content and costs a second attempt.
+    // Only the file this call rewrites says how long the reply will be. Sized from some other file
+    // that happens to be shown, a rewrite of a longer one is cut off mid-content; and a write with no
+    // known target is a new file, or several in one reply, which needs the room.
+    const own = target ? files.find((file) => file.path === target && file.exists) : undefined;
+    return own ? 2048 + Math.ceil(own.content.length / 3) : 8192;
   }
+  // An edit repeats old_string and new_string in full. Kept tight on purpose: thinking, not the
+  // answer, is what runs long, and a thinking attempt cut off early is retried without it. Given
+  // twice the room, the same runaways cost twice as much and answered no more.
   if (tool.name === 'edit_file') return 3072;
   return 1024;
 }
@@ -150,6 +164,8 @@ export class Agent {
    */
   private finding = '';
   private sinceFinding: string[] = [];
+  /** Whether the standing failure has already been turned into a repair; once is enough. */
+  private repairedFinding = false;
   /** Lines the last step added, offered to Jev as proof for the open criteria on the next decision. */
   private freshLines: Array<{ path: string; line: string }> = [];
   private fileCache: string[] = [];
@@ -459,7 +475,8 @@ export class Agent {
           // After a failed command, reading the file again is Jev looking for the cause, and it never
           // sees a file whole. The executor does: the repair is an edit of that file, briefed with the
           // file and the failure, not another look.
-          if (this.finding && !this.excludedTools.has('edit_file')) {
+          if (this.finding && !this.repairedFinding && !this.excludedTools.has('edit_file')) {
+            this.repairedFinding = true;
             onEvent({ type: 'notice', level: 'info', message: `Repairing ${reread.path} instead: the failure is in the brief.` });
             decision = { ...decision, tool: 'edit_file' };
             argChoices = { 'edit_file.path': reread.path };
@@ -909,7 +926,7 @@ export class Agent {
     const scripts = tool.commandArgs?.length ? await detectScripts(workspace, this.testCommand()) : [];
     const stage = decision.progressLegend[String(Math.round(decision.progress))];
     const gather = (paths: Record<string, string>) =>
-      gatherFiles({ tool, settled: paths, history: this.history, candidates, workspace, budget: Math.floor(budget * 0.6), references: jev.references });
+      gatherFiles({ tool, settled: paths, history: this.history, candidates, workspace, budget: Math.floor(budget * 0.6), references: { asked: this.referenceCandidates(), wanted: jev.references } });
 
     let files = gather(settled);
     this.announceContext(files, jev.intent);
@@ -926,16 +943,16 @@ export class Agent {
     // reply cut off by runaway thinking is not cured by a bigger budget to think in. With that retry
     // available, the first attempt only gets room for its answer plus a thinking allowance.
     const quickBody = config.llm.quickExtraBody;
-    const thinkingBudget = () => Math.min(config.llm.maxTokens, config.llm.thinkingAllowance + answerEstimate(tool, files));
+    const thinkingBudget = () => Math.min(config.llm.maxTokens, config.llm.thinkingAllowance + answerEstimate(tool, files, settled['path']));
     // Thinking is kept for the calls that need it: after a failure, or a step Jev calls a repair.
     // `jev`: Jev judged whether this step needs careful reasoning. Either way, a rejected quick
     // attempt is retried with thinking.
     const mode = config.llm.executorThinking;
     const thinkOnFailure = Boolean(quickBody) && mode !== 'always';
-    const struggling =
-      mode === 'jev' && jev.thinking !== undefined
-        ? jev.thinking >= 0.5
-        : this.history.at(-1)?.ok === false || jev.intent === 'repair';
+    // `after-failure` means a call this executor got wrong, not a step that looks hard: a step the
+    // agent calls a repair thinks its way to a 10k-token reply that is cut off before the call is
+    // complete, and the retry without thinking then answers it in a few hundred.
+    const struggling = mode === 'jev' && jev.thinking !== undefined ? jev.thinking >= THINK_THRESHOLD : false;
     // Only a call that writes code has anything to think about; a path, a pattern or a command is
     // copied from the brief, and grep once thought for 800 tokens to answer in 13.
     const writesCode = tool.mutates && Boolean(tool.pathArgs?.length);
@@ -944,7 +961,7 @@ export class Agent {
 
     for (let attempt = 0; attempt <= MAX_ARG_REPAIRS; attempt++) {
       const messages: LlmMessage[] = [
-        { role: 'system', content: executorSystem(tool, this.options.systemPrompt) },
+        { role: 'system', content: executorSystem(ACTION_TOOLS, this.options.systemPrompt) },
         {
           role: 'user',
           content: buildBrief({
@@ -958,7 +975,11 @@ export class Agent {
             candidates,
             scripts,
             files,
-            observationChars: Math.floor(budget * 0.15),
+            // A quoted result is there to act on, not to read twice: the compiler error, the failing
+            // assertion, the diff of the last change. The whole of a long one is prompt on every attempt.
+            observationChars: Math.min(1600, Math.floor(budget * 0.15)),
+            workspaceFiles: this.fileCache.slice(0, 60),
+            criteria: this.ledger.criteria.map(({ id, text }) => ({ id, text })),
             ledger: this.ledger.view(this.budget.steps, Math.floor(budget * 0.1)),
           }),
         },
@@ -983,10 +1004,13 @@ export class Agent {
       // shown, it has read the code and Jev has not: the fix for a crash in one file is often in the
       // module it calls. Its choice stands. A file it was not shown is sent back.
       const proposedRel = proposed ? relative(workspace, resolve(workspace, proposed)) : undefined;
-      const retarget = tool.mutates && settled['path'] && proposedRel && proposedRel !== settled['path'];
-      const seen = retarget && files.some((file) => file.path === proposedRel && file.exists);
-      if (seen) args['path'] = proposedRel;
-      const elsewhere = retarget && !seen;
+      const retarget =
+        tool.mutates && settled['path'] && proposedRel && proposedRel !== settled['path'] && !proposedRel.startsWith('..');
+      // The executor has read the code and Jev has not: the fix for a crash in one file is often in
+      // the module it calls. Its choice of an existing file stands, and the usual checks apply to it;
+      // a file that does not exist yet stands only for a tool that creates one.
+      const elsewhere = retarget && !existsSync(resolve(workspace, proposedRel)) && tool.name !== 'write_file';
+      if (retarget && !elsewhere) args['path'] = proposedRel;
       if (tool.name === 'edit_file' && !elsewhere) args = alignEdit(args, workspace);
 
       if (truncated && !parsed) {
@@ -995,7 +1019,7 @@ export class Agent {
         problems = !parsed
           ? ['The reply contained no tool call and no JSON arguments.']
           : elsewhere
-            ? [`This step changes ${settled['path']}, not ${proposed}; the other files are shown for reference. Put the change in ${settled['path']}.`]
+            ? [`${proposed} does not exist. This step changes ${settled['path']}; put the change there, or write a file that exists.`]
             : validateArgs(tool, args, workspace);
       }
       if (!problems.length) break;
@@ -1011,7 +1035,8 @@ export class Agent {
         maxTokens = config.llm.maxTokens;
         quick = true;
       } else if (thinkOnFailure && writesCode && quick && attempt === 0) {
-        // A quick attempt got it wrong: the retry gets to think.
+        // A quick attempt got the call wrong: the retry gets to think, inside the same small budget,
+        // so a reply that thinks its way past it is cut off early and answered without thinking.
         quick = false;
         maxTokens = thinkingBudget();
       } else {
@@ -1047,12 +1072,16 @@ export class Agent {
     // of its own. Anything doubtful is dropped rather than repaired — the main call is the step.
     const extra: Array<Record<string, unknown>> = [];
     if (tool.batchable && !problems.length) {
-      const seen = new Set([String(args['path'] ?? '')]);
+      // A write replaces a whole file, so one call per path. An edit replaces one passage, so several
+      // may touch the same file; what must not repeat is the passage. Each is checked against the
+      // file as it is now: one that the earlier edits invalidate fails when it runs, and says so.
+      const key = (call: Record<string, unknown>) =>
+        tool.name === 'edit_file' ? `${call['path']}\u0000${call['old_string']}` : String(call['path'] ?? '');
+      const seen = new Set([key(args)]);
       for (const raw of more) {
-        const call = relativise(schemaKeys(tool, raw));
-        const path = String(call['path'] ?? '');
-        if (!path || seen.has(path) || validateArgs(tool, call, workspace).length) continue;
-        seen.add(path);
+        const call = relativise(tool.name === 'edit_file' ? alignEdit(schemaKeys(tool, raw), workspace) : schemaKeys(tool, raw));
+        if (!call['path'] || seen.has(key(call)) || validateArgs(tool, call, workspace).length) continue;
+        seen.add(key(call));
         extra.push(call);
       }
     }
@@ -1075,23 +1104,36 @@ export class Agent {
     maxTokens: number,
     extraBody?: Record<string, unknown>,
     withProofs = false,
+    onlyThisTool = false,
   ): Promise<{ parsed: Record<string, unknown> | undefined; truncated: boolean; more: Array<Record<string, unknown>> }> {
     let buffer = '';
     const onToken = (token: string) => {
       buffer += token;
       this.options.onEvent({ type: 'llm-stream', channel: 'reasoning', text: buffer });
     };
-    const spec = {
+    // Every tool, every call, in the same order, with the same schemas: the tool definitions are
+    // rendered into the system turn, so a per-call list would be a different prefix each time and the
+    // server's cache would never hit. The one that runs is named in tool_choice.
+    const specs = ACTION_TOOLS.map((entry) => ({
       type: 'function' as const,
-      function: { name: tool.name, description: tool.description, parameters: withProofs ? withProofArg(tool.parameters) : tool.parameters },
-    };
+      function: {
+        name: entry.name,
+        description: entry.description,
+        parameters: PROVING_TOOLS.has(entry.name) && entry.mutates ? withProofArg(entry.parameters) : entry.parameters,
+      },
+    }));
+    void withProofs;
 
+    // Every tool is offered so the request's prefix is the same each time, but the model does not
+    // always honour the name in tool_choice: asked to edit, it has answered with a read. That reply's
+    // arguments are not this call's, so the request is made again with only the tool that may answer.
+    const offered = onlyThisTool ? specs.filter((entry) => entry.function.name === tool.name) : specs;
     const result =
       mode === 'forced'
         ? await this.options.llm.complete({
             messages,
-            tools: [spec],
-            toolChoice: 'required',
+            tools: offered,
+            toolChoice: onlyThisTool ? 'required' : { type: 'function', function: { name: tool.name } },
             maxTokens,
             ...(extraBody ? { extraBody } : {}),
             onToken,
@@ -1119,7 +1161,10 @@ export class Agent {
     this.options.onEvent({ type: 'budget', budget: { ...this.budget } });
 
     const truncated = result.finishReason === 'length';
-    const call = result.toolCalls.find((entry) => entry.function.name === tool.name) ?? result.toolCalls[0];
+    const call = result.toolCalls.find((entry) => entry.function.name === tool.name);
+    if (!call && result.toolCalls.length && mode === 'forced' && !onlyThisTool && !truncated) {
+      return this.llmCall(messages, tool, mode, maxTokens, extraBody, withProofs, true);
+    }
     if (call) {
       const parsed = safeJson(call.function.arguments);
       const more = result.toolCalls
@@ -1270,7 +1315,7 @@ export class Agent {
       this.budget.llmCompletionTokens += result.usage.completionTokens;
       // A cut-off reply is a thinking draft, and its numbered lines are not the criteria.
       const criteria = result.finishReason === 'length' ? [] : parseCriteria(result.content);
-      if (criteria.length) return criteria;
+      if (criteria.length) return this.coverNamedFiles(criteria);
     } catch (error) {
       this.options.onEvent({
         type: 'notice',
@@ -1279,6 +1324,20 @@ export class Agent {
       });
     }
     return [goal];
+  }
+
+  /**
+   * A file the goal asks for that no criterion mentions is a file nothing makes the run produce: a
+   * three-file app was twice finished with an empty stylesheet, every criterion met. Asking for it in
+   * the prompt did not survive a small model's summarising, so it is added here.
+   */
+  private coverNamedFiles(criteria: string[]): string[] {
+    const { goal } = this.options;
+    const named = [...new Set(goal.split(/[\s"'`(),;:]+/).map((word) => word.replace(/^\.\//, '').replace(/[.]+$/, '')))].filter(
+      (word) => /^[\w./-]+\.[A-Za-z]{1,5}$/.test(word),
+    );
+    const missing = named.filter((path) => !criteria.some((criterion) => goalNames(criterion, path)));
+    return [...criteria, ...missing.map((path) => `${path} exists and holds the part of the goal that belongs in it, not a placeholder.`)];
   }
 
   /**
@@ -1385,6 +1444,7 @@ export class Agent {
 
   private setFinding(finding: string): void {
     this.finding = finding;
+    this.repairedFinding = false;
     this.sinceFinding = [];
     this.notes = finding;
   }

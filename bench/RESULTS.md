@@ -6,62 +6,60 @@ Jeffrey vs. OpenCode on the same local model, five tasks, scored by hidden tests
 ## Setup
 
 Qwen3.6-35B-A3B-oQ4-mtp on oMLX (Apple silicon), 32k max output. OpenCode 1.18.15 with defaults.
-Jeffrey with `quickExtraBody` set, so it thinks only on the steps Jev says need it. Measured
-2026-09-19. Jeffrey rows are the mean of two runs per task, except pomodoro and pricing-bugfix,
-which are single runs from a build earlier the same evening; those two tasks were unaffected by the
-later changes. OpenCode rows are one run per task.
+Jeffrey with `quickExtraBody` set, so the executor thinks only on the steps the decision model says
+need it. Measured 2026-09-20: Jeffrey is the mean of two runs per task, OpenCode one run per task.
 
 ## Totals
 
 | agent | wall time | local LLM tokens | uncached | completion | checks passed |
 |---|---:|---:|---:|---:|---:|
-| **Jeffrey** | **10m 28s** | **135,689** | **130,569** | **37,847** | **44/47** |
+| **Jeffrey** | **8m 14s** | **159,064** | **116,055** | **28,666** | **43/47** |
 | OpenCode | 17m 30s | 1,196,676 | 197,530 | 44,259 | 44/47 |
 
-Three numbers, because they answer different questions. Total tokens is what the model server
-processed. Uncached is what a provider with prompt caching would bill at the full input price:
-OpenCode's conversation grows by appending, so 86.7% of its prompt came from the cache, while
-Jeffrey's per-step briefs get almost no reuse. Completion tokens are what no cache helps with, and
-they set most of the wall time.
+Three token columns, because they answer different questions. Total is what the model server
+processed. Uncached is what a provider with prompt caching bills at the full input price: OpenCode's
+conversation grows by appending, so 86.7% of its prompt comes from the cache, while Jeffrey's
+per-step briefs reuse a fixed head and little else. Completion tokens are what no cache helps with,
+and they set most of the wall time.
 
-Jeffrey also used 260k tokens on Jev, the remote decision model. Jev is a separate API and is not
-counted in local tokens.
+Jeffrey also used 211k tokens on Jev, the remote decision model, per suite. Jev is a separate API and
+is not counted in local tokens.
 
 ## Per task
 
-| task | kind | agent | wall time | LLM requests | local tokens | Jev tokens | checks |
+| task | kind | agent | wall time | LLM requests | local tokens | uncached | checks |
 |---|---|---|---:|---:|---:|---:|---:|
-| pomodoro | greenfield web app | Jeffrey | 0m 40s | 3 | 7,176 | 4,880 | 11/11 |
-| | | OpenCode | 1m 11s | 4 | 32,473 | — | 11/11 |
-| pricing-bugfix | bug fix to documented rules | Jeffrey | 0m 51s | 8 | 14,564 | 99,118 | 9/9 |
-| | | OpenCode | 0m 46s | 7 | 61,638 | — | 7/9 |
-| todo-due-dates | feature across module + CLI | Jeffrey | 3m 06s | 10 | 32,302 | 40,088 | 8/9 |
-| | | OpenCode | 5m 24s | 23 | 406,479 | — | 9/9 |
-| notes-api | HTTP route + validation | Jeffrey | 3m 32s | 17 | 49,162 | 71,345 | 8/10 |
-| | | OpenCode | 6m 06s | 27 | 525,839 | — | 9/10 |
-| expense-report | feature + bug fix, Python | Jeffrey | 2m 19s | 14 | 32,485 | 44,638 | 8/8 |
-| | | OpenCode | 4m 03s | 14 | 170,247 | — | 8/8 |
+| pomodoro | greenfield web app | Jeffrey | 1m 47s | 15 | 47,796 | 28,340 | 22/22 |
+| | | OpenCode | 1m 11s | 4 | 32,473 | 32,473 | 11/11 |
+| pricing-bugfix | bug fix to documented rules | Jeffrey | 0m 32s | 5 | 12,787 | 10,739 | 17/18 |
+| | | OpenCode | 0m 46s | 7 | 61,638 | 8,202 | 7/9 |
+| todo-due-dates | feature across module + CLI | Jeffrey | 2m 29s | 11 | 37,304 | 31,160 | 17/18 |
+| | | OpenCode | 5m 24s | 23 | 406,479 | 65,927 | 9/9 |
+| notes-api | HTTP route + validation | Jeffrey | 2m 14s | 9 | 35,273 | 27,081 | 14/20 |
+| | | OpenCode | 6m 06s | 27 | 525,839 | 62,303 | 9/10 |
+| expense-report | feature + bug fix, Python | Jeffrey | 1m 13s | 10 | 25,904 | 18,736 | 16/16 |
+| | | OpenCode | 4m 03s | 14 | 170,247 | 28,625 | 8/8 |
 
-Checks missed. Jeffrey: notes-api's whitespace-only title and one PATCH case; one todo-due-dates run
-finished before writing tests, because its acceptance criteria did not name them. OpenCode:
-notes-api's whitespace-only title, and pricing-bugfix's rule that a discount never makes an amount
-negative (both of its checks).
+Jeffrey's checks are out of two runs, OpenCode's out of one. OpenCode's uncached column is derived
+from the cache hits its own run database records.
+
+Checks missed. Jeffrey: notes-api's validation cases, in both runs, and one run of each of
+pricing-bugfix and todo-due-dates. OpenCode: notes-api's whitespace-only title, and pricing-bugfix's
+rule that a discount never makes an amount negative.
 
 ## Takeaways
 
-- Fewer requests, not just shorter ones. Jeffrey makes 3 to 17 local calls per task against
-  OpenCode's 4 to 27. A read, a search or a command whose arguments the decision model has settled
-  runs with no local call at all, and only a failed command is read back by a model.
-- The token gap is mostly prompt, and prompt is what caching makes cheap. Raw totals differ by 8.8x,
-  but on a caching provider the honest comparison is uncached tokens, where the gap is 1.5x, and
-  completion tokens, where it is 1.2x. The time difference is real and is not explained by tokens.
-- Deciding costs less than writing. Moving work to the decision model (which file a step works on,
-  which line proves an acceptance criterion, whether a step needs careful reasoning, which imported
-  files the call has to see) removes local calls and local prompt.
-- Correctness is level overall, and different per task. Only Jeffrey fixed the documented pricing
-  rule no visible test covers. OpenCode was steadier on the two feature tasks.
-- notes-api is the noisy one. Across builds it lands between 8 and 9 of 10, on whether the first
-  edit gets the handler right.
+- Fewer requests, not just shorter ones. Jeffrey makes 5 to 15 local calls per task against
+  OpenCode's 4 to 27. A read, a search or a command whose arguments the decision model settled runs
+  with no local call at all, and only a change or a failed command is read back by a model.
+- Raw token totals flatter Jeffrey. The gap is 7.5x on totals, 1.7x on uncached tokens and 1.5x on
+  completion tokens. On a caching provider the last two are the bill.
+- Time is where the difference is clearest: 8m 14s against 17m 30s, on the same model and machine.
+- Deciding costs less than writing. The decision model settles which file a step works on, which
+  line proves an acceptance criterion, which imported files the call has to see, and whether the step
+  needs the executor to think at all. Each of those removes local tokens.
+- notes-api is the weak task, and the noisy one. Across builds it lands between 5 and 9 of 10, on
+  whether the first edit gets the route right; nothing else in the suite swings that far.
 
 ## Reproduce
 

@@ -44,7 +44,7 @@ export interface LlmResult {
 export interface CompleteOptions {
   messages: LlmMessage[];
   tools?: LlmToolSpec[];
-  toolChoice?: 'auto' | 'none' | 'required';
+  toolChoice?: 'auto' | 'none' | 'required' | { type: 'function'; function: { name: string } };
   temperature?: number;
   maxTokens?: number;
   /** Called with each incremental token so the TUI can render as it arrives. */
@@ -239,6 +239,7 @@ export class MockLlmClient implements LlmClient {
     }
     const toolName = /Call this tool now:\s*(\w+)/.exec(brief)?.[1];
     const schema =
+      (options.tools?.find((entry) => entry.function.name === toolName)?.function.parameters as MockSchema | undefined) ??
       (options.tools?.[0]?.function.parameters as MockSchema | undefined) ??
       extractTrailingJson(options.messages.at(-1)?.content ?? '') ??
       extractTrailingJson(system);

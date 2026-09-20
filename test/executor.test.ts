@@ -8,8 +8,14 @@ import { Agent } from '../src/core/agent.js';
 import { MockJevClient } from '../src/core/mock-jev.js';
 import { alignEdit, buildBrief, gatherFiles, validateArgs } from '../src/core/executor.js';
 import { localImports } from '../src/core/languages.js';
-import { TOOLS_BY_NAME } from '../src/core/tools.js';
+import { ACTION_TOOLS, TOOLS_BY_NAME } from '../src/core/tools.js';
 import type { CompleteOptions, LlmClient, LlmResult } from '../src/core/llm.js';
+
+/** The tool the agent forced for this call: every tool is offered, one is named in tool_choice. */
+function chosenTool(options: CompleteOptions): string {
+  const choice = options.toolChoice;
+  return typeof choice === 'object' ? choice.function.name : (options.tools?.[0]?.function.name ?? 'write_file');
+}
 import type { AgentEvent } from '../src/types.js';
 
 /**
@@ -122,7 +128,10 @@ test('the executor sees the intent and the target file, and a rejected call is r
   assert.match(first, /This step is for: make the change the goal asks for/);
   assert.match(first, /Current contents of src\/math\.ts/);
   assert.ok(first.includes(SOURCE.trimEnd()), 'the file contents must be in the brief verbatim');
+  // The tool's own rules ride in the instruction turn, so the system turn stays the same on every
+  // call and the server can serve the prefix from its cache.
   assert.match(calls[0]!.messages[0]!.content!, /Copy old_string character-for-character/);
+  assert.equal(calls[0]!.messages[0]!.content, calls[1]!.messages[0]!.content, 'one system turn for every tool');
 
   const repair = calls[1]!.messages.at(-1)!.content!;
   assert.match(repair, /rejected before it ran/);
@@ -228,7 +237,7 @@ class ProvingExecutor implements LlmClient {
     if (/planning half/.test(system)) {
       return { content: '1. app.js saves the count in localStorage\n2. app.js ticks every second', toolCalls: [], usage, finishReason: 'stop' };
     }
-    const writing = options.tools?.[0]?.function.name === 'write_file';
+    const writing = chosenTool(options) === 'write_file';
     if (writing) this.writes += 1;
     const args = writing
       ? {
@@ -239,7 +248,7 @@ class ProvingExecutor implements LlmClient {
       : { path: 'app.js' };
     return {
       content: '',
-      toolCalls: [{ id: 'c', type: 'function', function: { name: options.tools![0]!.function.name, arguments: JSON.stringify(args) } }],
+      toolCalls: [{ id: 'c', type: 'function', function: { name: chosenTool(options), arguments: JSON.stringify(args) } }],
       usage,
       finishReason: 'tool_calls',
     };
@@ -348,7 +357,7 @@ class TestGatedExecutor implements LlmClient {
       return { content: '1. app.js exports a tick function\n2. app.js exports ok', toolCalls: [], usage, finishReason: 'stop' };
     }
     if (!options.tools?.length) return { content: 'Yes.', toolCalls: [], usage, finishReason: 'stop' };
-    const name = options.tools?.[0]?.function.name ?? 'write_file';
+    const name = chosenTool(options);
     this.writes += name === 'write_file' ? 1 : 0;
     const args =
       name === 'write_file'
@@ -587,4 +596,36 @@ test('an edit that meets a criterion is proven from Jev\'s pick of the lines it 
 
   const ledger = JSON.stringify((jev.seenStates as Array<Record<string, unknown>>).at(-1)?.['ledger'] ?? {});
   assert.match(ledger, /"status":"met","evidence":"src\/math\.ts: return a \+ b; \/\/ add, never subtract"/);
+});
+
+/** Answers the first forced call with a different tool than the one named, then the right one. */
+class StrayingExecutor implements LlmClient {
+  readonly label = 'straying';
+  readonly offered: number[] = [];
+  async complete(options: CompleteOptions): Promise<LlmResult> {
+    const usage = { promptTokens: 0, completionTokens: 0 };
+    if (!options.tools?.length) return { content: 'Yes.', toolCalls: [], usage, finishReason: 'stop' };
+    this.offered.push(options.tools.length);
+    const stray = this.offered.length === 1;
+    const call = stray
+      ? { name: 'read_file', arguments: JSON.stringify({ path: 'src/math.ts' }) }
+      : { name: 'edit_file', arguments: JSON.stringify({ path: 'src/math.ts', old_string: '  return a - b;', new_string: '  return a + b;' }) };
+    return { content: '', toolCalls: [{ id: 'c', type: 'function', function: call }], usage, finishReason: 'tool_calls' };
+  }
+}
+
+test('a reply that calls a tool other than the one asked for is asked again with only that tool', async () => {
+  const dir = await workspace();
+  const llm = new StrayingExecutor();
+  await new Agent({
+    goal: 'fix the add function in src/math.ts, it subtracts',
+    config: { ...DEFAULT_CONFIG, agent: { ...DEFAULT_CONFIG.agent, workspace: dir, autoApprove: true, maxSteps: 1 } },
+    llm,
+    jev: new MockJevClient({ tools: ['edit_file'] }),
+    onEvent: () => {},
+    approve: async () => 'allow',
+  }).run();
+
+  assert.deepEqual(llm.offered.slice(0, 2), [ACTION_TOOLS.length, 1], 'every tool, then only edit_file');
+  assert.equal(await readFile(join(dir, 'src', 'math.ts'), 'utf8'), SOURCE.replace('a - b', 'a + b'));
 });

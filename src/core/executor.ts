@@ -15,19 +15,14 @@ import { describeLedger, type LedgerView } from './ledger.js';
  * call needs, and `validateArgs` catches the calls that would fail anyway before they cost a step.
  */
 
-export const EXECUTOR_SYSTEM = `You are the executor half of a two-model coding agent.
+export const EXECUTOR_SYSTEM = `You are the executor half of a two-model coding agent. A decision model
+has chosen the tool and the step's purpose; you write the arguments for that one call, nothing else.
 
-A separate decision model (Jev) has already chosen the tool and what this step is for. That decision
-is final: you do not pick a different tool, and you do not decide the task is finished. Your only
-output is the arguments for that one tool call.
-
-Rules:
-- Arguments the decision model settled are fixed. Use them exactly as given.
-- Every other argument must be concrete, complete, and ready to execute. No placeholders, no "...",
-  no TODO, no "rest of file unchanged".
-- Serve the step's purpose, not the whole goal. A "locate" step finds code; it does not change it.
-- Use only paths from the workspace files, the history, or the file contents you were shown — or a
-  new path when the step is creating a file.
+- Settled arguments are fixed. Use them exactly.
+- Every other argument is concrete and complete: no placeholders, no "...", no "rest unchanged".
+- Serve the step's purpose, not the whole goal.
+- Use paths from the workspace files, the history or the contents shown, or a new path when the step
+  creates a file.
 - Do not explain. The tool call is the deliverable.`;
 
 /**
@@ -55,7 +50,8 @@ export const CRITERIA_SYSTEM = `You are the planning half of a two-model coding 
 user's goal into the acceptance criteria that define "done".
 
 Rules:
-- 2 to 4 criteria, as a numbered list, one per line, nothing else.
+- 2 to 6 criteria, as a numbered list, one per line, nothing else. Use as many as the goal needs and
+  no more.
 - Each one must be checkable from evidence a tool can produce: a file's contents, a command's output,
   a test result. The tools read files, search them and run shell commands — nothing can open a
   browser or click through a UI. So state behaviour as the code that implements it ("the handler in
@@ -65,6 +61,8 @@ Rules:
 - Nothing that can only be shown by an absence ("uses no framework", "makes no network requests").
 - Cover what the goal asks for and how it will be shown to work. Do not invent extra scope.
 - When the goal asks for tests as well, one criterion is about the test file and what it checks.
+- Every file the goal asks for gets a criterion about what has to be in that file. A criterion about
+  one file referring to another says nothing about what the other one contains.
 - No preamble, no explanation.`;
 
 /** Jev's answer to "what is this call for?", phrased for the executor. */
@@ -102,16 +100,25 @@ export interface BriefInput {
   observationChars: number;
   /** What the run has established so far, beyond the history window. */
   ledger?: LedgerView;
+  /** The acceptance criteria as written, which do not change between steps. */
+  criteria?: Array<{ id: number; text: string }>;
+  /** Every file in the workspace, by name. */
+  workspaceFiles?: string[];
 }
 
-export function executorSystem(tool: ToolSpec, extra?: string): string {
-  const parts = [EXECUTOR_SYSTEM];
-  if (extra) parts.push(extra);
-  if (tool.executorHints?.length) {
-    parts.push(`For ${tool.name}:\n${tool.executorHints.map((hint) => `- ${hint}`).join('\n')}`);
-  }
-  // No schema here: the request's tool definition carries it, and a JSON-mode retry appends it.
-  return parts.join('\n\n');
+/**
+ * The same system turn for every call, so consecutive requests share a prefix the server can serve
+ * from its cache. What is specific to one tool rides in the instruction turn at the end, where it
+ * changes nothing the cache depends on.
+ */
+export function executorSystem(tools: ToolSpec[], extra?: string): string {
+  // Every tool's rules, always, in tool order: text that is the same on every call belongs in the
+  // part of the request a cache can serve. No schema here: the request's tool definitions carry it.
+  const rules = tools
+    .filter((tool) => tool.executorHints?.length)
+    .map((tool) => `For ${tool.name}:\n${tool.executorHints!.map((hint) => `- ${hint}`).join('\n')}`)
+    .join('\n\n');
+  return [EXECUTOR_SYSTEM, extra, rules].filter(Boolean).join('\n\n');
 }
 
 export function buildBrief(input: BriefInput): string {
@@ -121,7 +128,14 @@ export function buildBrief(input: BriefInput): string {
   // No absolute workspace path: shown one, a small model writes absolute paths and garbles them
   // (a dropped directory once sent a whole file outside the workspace, refused, and rewritten).
   const lines = [`Goal: ${input.goal}`, 'Workspace: the current folder. Every path is relative to it, e.g. index.html or src/app.ts.'];
+  if (input.workspaceFiles?.length) lines.push('', `Files in the workspace: ${input.workspaceFiles.join(', ')}`);
 
+  // The criteria's wording never changes, so it belongs in the part of the brief that is the same on
+  // every call; how they stand is in the ledger further down, where it changes freely.
+  if (input.criteria?.length) {
+    lines.push('', 'What this run has to show:');
+    for (const criterion of input.criteria) lines.push(`  ${criterion.id}. ${criterion.text}`);
+  }
   if (input.candidates.length) {
     lines.push('', `Files most likely relevant: ${input.candidates.join(', ')}`);
   }
@@ -219,9 +233,17 @@ export function callMessage(
  * already named in the executor's own call. Otherwise it is whatever the recent history worked on,
  * then the best-ranked candidate, so an unsettled `edit_file` still has something real to copy from.
  */
+/** Candidate order first, then settled targets, so the list does not reshuffle between steps. */
+function rank(path: string, candidates: string[], settled: string[]): number {
+  const at = candidates.indexOf(path);
+  if (at >= 0) return at;
+  return candidates.length + settled.indexOf(path) + 1;
+}
+
 export function gatherFiles(input: {
-  /** Imported files Jev judged this call needs; when absent, every import is shown. */
-  references?: string[];
+  /** Imported files Jev was asked about, and the ones it judged this call needs. A file Jev was not
+   * asked about is shown: the allowlist withholds only what Jev turned down. */
+  references?: { asked: string[]; wanted: string[] };
   tool: ToolSpec;
   settled: Record<string, string>;
   history: HistoryEntry[];
@@ -238,12 +260,22 @@ export function gatherFiles(input: {
     .reverse()
     .map((entry) => entry.args['path'])
     .filter((p): p is string => typeof p === 'string');
-  const ordered = settledPaths.length ? settledPaths : [...touched, ...candidates.slice(0, 1)];
+  // The same files, in the same order, on every call of a run: a brief that shows a different file
+  // each step shares no prefix with the last one, and the server's cache never hits. The target is
+  // always in it; the other slot goes to the best-ranked candidate, whichever step this is.
+  const pinned = candidates.slice(0, 2);
+  const ordered = [...new Set([...pinned, ...settledPaths, ...(settledPaths.length ? [] : touched)])].sort(
+    (a, b) => rank(a, candidates, settledPaths) - rank(b, candidates, settledPaths),
+  );
+  // The file this step changes goes last. Everything before it is the same text as last step, and a
+  // cache can only serve a prefix: put the file that is about to change first and it serves nothing.
+  const changing = new Set(tool.mutates ? settledPaths : []);
+  ordered.sort((a, b) => Number(changing.has(a)) - Number(changing.has(b)));
 
   const out: FileContext[] = [];
   let remaining = budget;
   for (const path of [...new Set(ordered)]) {
-    if (out.length >= 2 || remaining <= 0) break;
+    if (out.length >= 3 || remaining <= 0) break;
     const absolute = inside(workspace, path);
     if (!absolute) continue;
     if (!existsSync(absolute)) {
@@ -269,10 +301,10 @@ export function gatherFiles(input: {
   // prompt the executor pays for on every attempt.
   const target = out.find((file) => file.exists);
   if (target) {
-    const wanted = input.references;
+    const references = input.references;
     for (const path of localImports(workspace, target.path, target.content)) {
       if (out.length >= 4 || remaining <= 0) break;
-      if (wanted && !wanted.includes(path)) continue;
+      if (references?.asked.includes(path) && !references.wanted.includes(path)) continue;
       if (out.some((file) => file.path === path)) continue;
       try {
         const raw = readFileSync(resolve(workspace, path), 'utf8');
