@@ -33,6 +33,10 @@ jobs:
 
       - run: npm run typecheck
 
+      # Must precede the tests: some of them spawn bin/jeffrey.js, which imports
+      # dist/. prepublishOnly rebuilds from clean, but only at publish time.
+      - run: npm run build
+
       - run: npm test
 
       - name: Prove the loop still runs end to end
