@@ -1,9 +1,28 @@
 {
-  "name": "jeffrey",
+  "name": "@thomasbrueggemann/jeffrey",
   "version": "0.1.0",
   "description": "A coding agent CLI where Jev (TypeSafe System One) decides what to do next and a configurable LLM does the work.",
   "license": "MIT",
   "type": "module",
+  "homepage": "https://github.com/thomasbrueggemann/jeffrey#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/thomasbrueggemann/jeffrey.git"
+  },
+  "bugs": {
+    "url": "https://github.com/thomasbrueggemann/jeffrey/issues"
+  },
+  "keywords": [
+    "cli",
+    "coding-agent",
+    "agent",
+    "llm",
+    "jev",
+    "typesafe",
+    "laya",
+    "ollama",
+    "local-llm"
+  ],
   "bin": {
     "jeffrey": "./bin/jeffrey.js"
   },
@@ -15,13 +34,19 @@
   "engines": {
     "node": ">=22"
   },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "clean": "rm -rf dist",
     "dev": "tsx src/cli.tsx",
     "start": "node bin/jeffrey.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsx --test test/*.test.ts",
-    "selftest": "mkdir -p \"${TMPDIR:-/tmp}/jeffrey-selftest\" && tsx src/cli.tsx --jev-mock --llm-mock --print --yes -C \"${TMPDIR:-/tmp}/jeffrey-selftest\" \"selftest: prove the loop routes, executes and re-scores\""
+    "selftest": "mkdir -p \"${TMPDIR:-/tmp}/jeffrey-selftest\" && tsx src/cli.tsx --jev-mock --llm-mock --print --yes -C \"${TMPDIR:-/tmp}/jeffrey-selftest\" \"selftest: prove the loop routes, executes and re-scores\"",
+    "prepublishOnly": "npm run clean && npm run build"
   },
   "dependencies": {
     "ink": "^7.1.1",

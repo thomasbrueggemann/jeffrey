@@ -33,12 +33,27 @@ The loop is `decide → tool → decide → tool → …` until the goal is scor
 ## Install
 
 ```bash
+npm install -g @thomasbrueggemann/jeffrey
+jeffrey --help
+```
+
+Or without installing anything:
+
+```bash
+npx @thomasbrueggemann/jeffrey --help
+```
+
+Requires Node >= 22 (Ink 7).
+
+To work on it instead of just running it:
+
+```bash
+git clone https://github.com/thomasbrueggemann/jeffrey.git
+cd jeffrey
 npm install
 npm run build
 node bin/jeffrey.js --help      # or: npm link && jeffrey --help
 ```
-
-Requires Node >= 22 (Ink 7).
 
 ## Configure
 
