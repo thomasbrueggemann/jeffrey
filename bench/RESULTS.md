@@ -61,6 +61,66 @@ rule that a discount never makes an amount negative.
 - notes-api is the weak task, and the noisy one. Across builds it lands between 5 and 9 of 10, on
   whether the first edit gets the route right; nothing else in the suite swings that far.
 
+## Why the tokens stop here
+
+Per suite the local model sees 49 requests: 2,661 prompt tokens each, of which 1,783 are not served
+from the cache, and 585 completion tokens each. That shape sets the floor.
+
+- The brief has to carry the file being changed. An edit cannot be written without the text it
+  replaces, and that text is most of the prompt. Showing one file instead of two took a suite to
+  108k uncached tokens, within 9% of half OpenCode's, and cost eight checks out of 94. The tokens
+  that look like waste are what the executor needs to be right.
+- The cache returns one block, not the whole prompt. The server serves 2048-token blocks of an
+  identical prefix, and the stable head here is about 2,300 tokens: the system turn, the tool
+  definitions, the goal, the criteria and the file list. Growing that head to catch a second block
+  costs those tokens on every request that misses. Tried: prompt grew 93k and cached grew 104k over
+  ten runs, for no change in what was billed.
+- Completion tokens have no cache at all. They are 29k of the 116k, and they are the answer itself:
+  the new content of an edit, the note after a change.
+- What is left is steps. Cutting a step saves a whole request, which is why the decision model
+  settling an argument, or a change carrying its own proof, moved more than any prompt trimming.
+
+OpenCode's 197,530 uncached tokens come out of 1.2M sent, because an append-only conversation is
+almost entirely cache. Jeffrey sends 159k and reuses little. Below roughly this point the two agents
+are paying for the same thing: the code they have to read and the code they have to write.
+
+## Why the checks stop here
+
+The four checks missed per suite are not spread evenly. They sit on the validation cases of one
+task, and that task swings between 5 and 9 of 10 across builds that differ in nothing that should
+matter to it.
+
+- The run is decided by the first edit. When the first attempt writes a handler that works, the run
+  ends in three or four steps. When it writes one that throws, everything after is repair, and the
+  repair has to work from a failing assertion rather than from the code that was wrong.
+- The decision model cannot see the mistake. It routes from a state summary and never sees a file
+  whole, by design. It can tell that tests failed; it cannot tell that a handler calls a method the
+  module does not define.
+- A proven criterion is a quote, not a behaviour. Criteria are proven by finding a line in a file.
+  A handler that answers 500 still proves "the handler updates the note and responds 200" if the
+  line is there. That is why a run can finish with every criterion met and hidden tests failing.
+
+So the ceiling is the executor's first attempt at code, and nothing in the loop above it can lift
+that ceiling, only notice afterwards that it was too low.
+
+## What this benchmark does not test
+
+Every run here has the same decision model in the loop, so these numbers say nothing about what it
+contributes. The comparison is Jeffrey against another agent, never Jeffrey against itself with a
+worse decision maker. Three runs would answer it, and none of them has been done:
+
+1. Route with the local model instead. Same tools, same state, same executor; the local model
+   answers "which action next" in place of the decision model. If the checks hold, the decision
+   model is buying speed and tokens rather than correctness.
+2. Route with a fixed policy. Read, change, test, repeat, with no model deciding anything. A suite
+   this small may not need a router at all, and that would be worth knowing before tuning one.
+3. Vary the decision model's quality deliberately, by degrading its state (shorter history, no
+   ledger) and watching which checks fail first. That says which part of what it is told is doing
+   the work.
+
+Until one of those is run, "a better decision maker gives better results" is an assumption in this
+repository, not a finding.
+
 ## Reproduce
 
 ```bash
