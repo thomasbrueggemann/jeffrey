@@ -36,12 +36,17 @@ logs, the token meter log and every run's working folder are kept under
 | metric | how | why this way |
 |---|---|---|
 | Wall time | from spawning the agent to its exit | what a user waits for; includes every model call, tool and test run |
-| Local LLM tokens | prompt + completion tokens as reported by the model server, per request | counted at the one place both agents share (see below), thinking included |
+| Local LLM tokens | prompt + generation tokens as reported by the model server, per request | counted at the one place both agents share (see below), thinking included |
 | Cached prompt tokens | `usage.prompt_tokens_details.cached_tokens`, per request | prompt the server served from its prefix cache: near-free in time, and what a hosted provider bills at a fraction of the input price. Uncached tokens are the honest cost comparison |
 | LLM requests | chat-completion calls through the proxy | a proxy for round trips; each one pays prompt processing |
 | Cut off | requests that ended with `finish_reason: length` | truncated output is wasted generation |
 | Jev calls / tokens | from Jeffrey's session log (`~/.jeffrey/sessions`) | Jev is a remote API the proxy never sees; reported separately, never added to local tokens |
 | Checks | task-specific scoring, below | correctness; speed and tokens mean nothing without it |
+
+The token columns in [RESULTS.md](RESULTS.md) are sums over every request of a suite:
+`local LLM tokens = prompt + generation`, and `uncached = (prompt − cached) + generation`. Generation
+is the model's own output — the OpenAI `usage.completion_tokens` field — so it is part of the
+uncached number, not a fourth bucket next to it.
 
 ### Token metering
 
@@ -50,12 +55,12 @@ logs, the token meter log and every run's working folder are kept under
 
 - forwards requests unchanged, except that it forces `stream_options.include_usage` on streaming
   requests, so a client that does not ask for usage is still counted;
-- records the server's own `usage` for every chat completion (prompt, completion, cached prompt tokens, finish reason, latency);
+- records the server's own `usage` for every chat completion (prompt, generation via `completion_tokens`, cached prompt tokens, finish reason, latency);
 - cancels the upstream request when a client disconnects, so an aborted run does not keep the GPU busy;
 - with `--no-think`, injects the same body field into every request of both agents.
 
 Because counting happens at the server, neither agent's own accounting is trusted, and a thinking
-model's hidden reasoning is included in completion tokens.
+model's hidden reasoning is included in generation tokens.
 
 ### Isolation and fairness
 
@@ -138,11 +143,11 @@ tasks and runs, next to total time and tokens.
 - One run is an anecdote. Local generation is sampled, and one long reasoning burst can double a
   run's time. Compare with `--runs 2` or more, and look at the spread before the mean.
 - Tokens and time do not move together. Prompt tokens are cheap on a local server with prefix
-  caching; completion tokens cost wall time. An agent that resends a long conversation every turn
+  caching; generation tokens cost wall time. An agent that resends a long conversation every turn
   can use many prompt tokens and still be quick; one that thinks at length is slow on few tokens.
 - Total tokens overstate the gap. An agent whose conversation grows by appending gets most of its
   prompt from the cache: oMLX serves it in 2048-token blocks, and hosted providers bill cache reads
-  at a fraction of the input price. The uncached column is the number to compare, and completion
+  at a fraction of the input price. The uncached column is the number to compare, and generation
   tokens, which no cache helps, are the number that sets wall time.
 - Jev tokens are a different currency. They are billed by a remote API and do not touch the
   local GPU. Report them, but do not add them to local tokens.

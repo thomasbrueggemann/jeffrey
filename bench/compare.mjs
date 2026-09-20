@@ -227,7 +227,7 @@ function render(results) {
     );
   }
 
-  lines.push('', '| task | run | wall time | LLM requests | prompt tokens | of which cached | completion tokens | total LLM tokens | cut off | Jev calls / tokens | checks |', '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|');
+  lines.push('', '| task | run | wall time | LLM requests | prompt tokens | of which cached | generation tokens | total LLM tokens | cut off | Jev calls / tokens | checks |', '|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|');
   for (const r of results) {
     lines.push(
       `| ${r.task} | ${r.runner} #${r.run}${r.exit.timedOut ? ' (timed out)' : ''} | ${fmtTime(r.seconds)} | ${r.requests} | ${fmt(r.promptTokens)} | ${fmt(r.cachedTokens ?? 0)} | ${fmt(r.completionTokens)} | ${fmt(r.promptTokens + r.completionTokens)} | ${r.truncated} | ${r.jev ? `${r.jev.calls} / ${fmt(r.jev.inputTokens + r.jev.outputTokens)}` : '—'} | ${r.score.passed}/${r.score.total} |`,

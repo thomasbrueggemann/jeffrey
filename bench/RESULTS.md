@@ -11,16 +11,27 @@ need it. Measured 2026-09-20: Jeffrey is the mean of two runs per task, OpenCode
 
 ## Totals
 
-| agent | wall time | local LLM tokens | uncached | completion | checks passed |
+| agent | wall time | local LLM tokens | uncached | generation | checks passed |
 |---|---:|---:|---:|---:|---:|
 | **Jeffrey** | **8m 14s** | **159,064** | **116,055** | **28,666** | **43/47** |
 | OpenCode | 17m 30s | 1,196,676 | 197,530 | 44,259 | 44/47 |
 
-Three token columns, because they answer different questions. Total is what the model server
+Three token columns, because they answer different questions. Every request the model server
+handles reports *prompt* tokens (what it read, some of which it served from its prefix cache) and
+*generation* tokens (what it wrote, hidden reasoning included). The columns are sums of those over
+the whole suite:
+
+```
+local LLM tokens = prompt + generation
+uncached         = (prompt − cached) + generation
+```
+
+So generation sits inside uncached rather than beside it. Total is everything the model server
 processed. Uncached is what a provider with prompt caching bills at the full input price: OpenCode's
 conversation grows by appending, so 86.7% of its prompt comes from the cache, while Jeffrey's
-per-step briefs reuse a fixed head and little else. Completion tokens are what no cache helps with,
-and they set most of the wall time.
+per-step briefs reuse a fixed head and little else. Generation is the answer itself — the new text
+of an edit, the arguments of a tool call, the reasoning before either — and it is what no cache ever
+helps with, so it sets most of the wall time.
 
 Jeffrey also used 211k tokens on Jev, the remote decision model, per suite. Jev is a separate API and
 is not counted in local tokens.
@@ -53,7 +64,7 @@ rule that a discount never makes an amount negative.
   OpenCode's 4 to 27. A read, a search or a command whose arguments the decision model settled runs
   with no local call at all, and only a change or a failed command is read back by a model.
 - Raw token totals flatter Jeffrey. The gap is 7.5x on totals, 1.7x on uncached tokens and 1.5x on
-  completion tokens. On a caching provider the last two are the bill.
+  generation tokens. On a caching provider the last two are the bill.
 - Time is where the difference is clearest: 8m 14s against 17m 30s, on the same model and machine.
 - Deciding costs less than writing. The decision model settles which file a step works on, which
   line proves an acceptance criterion, which imported files the call has to see, and whether the step
@@ -64,7 +75,7 @@ rule that a discount never makes an amount negative.
 ## Why the tokens stop here
 
 Per suite the local model sees 49 requests: 2,661 prompt tokens each, of which 1,783 are not served
-from the cache, and 585 completion tokens each. That shape sets the floor.
+from the cache, and 585 generation tokens each. That shape sets the floor.
 
 - The brief has to carry the file being changed. An edit cannot be written without the text it
   replaces, and that text is most of the prompt. Showing one file instead of two took a suite to
@@ -75,7 +86,7 @@ from the cache, and 585 completion tokens each. That shape sets the floor.
   definitions, the goal, the criteria and the file list. Growing that head to catch a second block
   costs those tokens on every request that misses. Tried: prompt grew 93k and cached grew 104k over
   ten runs, for no change in what was billed.
-- Completion tokens have no cache at all. They are 29k of the 116k, and they are the answer itself:
+- Generation tokens have no cache at all. They are 29k of the 116k, and they are the answer itself:
   the new content of an edit, the note after a change.
 - What is left is steps. Cutting a step saves a whole request, which is why the decision model
   settling an argument, or a change carrying its own proof, moved more than any prompt trimming.

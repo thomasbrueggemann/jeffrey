@@ -7,7 +7,8 @@ import { appendFileSync } from 'node:fs';
  * Both agents are pointed at `http://127.0.0.1:<port>/t/<tag>/v1`, so every request is counted at the
  * one place they share — the model server's own `usage` — rather than trusting each tool's report.
  * Streaming requests get `stream_options.include_usage` forced on, so a client that does not ask for
- * usage is still counted. Completion tokens include a thinking model's hidden reasoning.
+ * usage is still counted. Generation tokens (`usage.completion_tokens`) include a thinking model's
+ * hidden reasoning.
  */
 export function startProxy({ upstream, port, logFile, inject }) {
   const target = new URL(upstream);
