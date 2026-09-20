@@ -4,7 +4,7 @@ import { mkdtemp, writeFile, mkdir, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DEFAULT_CONFIG, type Config } from '../src/config.js';
-import { Agent } from '../src/core/agent.js';
+import { Agent, extractJsonObject, unwrapToolArguments } from '../src/core/agent.js';
 import { MockDecider } from '../src/core/deciders/mock.js';
 import { alignEdit, buildBrief, gatherFiles, validateArgs } from '../src/core/executor.js';
 import { localImports } from '../src/core/languages.js';
@@ -628,4 +628,65 @@ test('a reply that calls a tool other than the one asked for is asked again with
 
   assert.deepEqual(llm.offered.slice(0, 2), [ACTION_TOOLS.length, 1], 'every tool, then only edit_file');
   assert.equal(await readFile(join(dir, 'src', 'math.ts'), 'utf8'), SOURCE.replace('a - b', 'a + b'));
+});
+
+/** A server that ignores tool_choice and answers with the call as text, the way oMLX does. */
+class TextCallExecutor extends ScriptedExecutor {
+  constructor(private readonly wrap: (args: Record<string, unknown>) => string) {
+    super([{ path: 'src/math.ts', old_string: 'return a - b;', new_string: 'return a + b;' }]);
+  }
+
+  override async complete(options: CompleteOptions): Promise<LlmResult> {
+    const result = await super.complete(options);
+    const call = result.toolCalls[0];
+    if (!call) return result;
+    return { ...result, content: this.wrap(JSON.parse(call.function.arguments)), toolCalls: [], finishReason: 'stop' };
+  }
+}
+
+const TEXT_CALL_SHAPES: Array<[string, (args: Record<string, unknown>) => string]> = [
+  ['bare', (args) => JSON.stringify(args)],
+  ['under "arguments"', (args) => JSON.stringify({ arguments: args })],
+  ['under "tool_call"', (args) => JSON.stringify({ tool_call: { type: 'edit_file', arguments: args } })],
+  ['missing the wrapper brace', (args) => JSON.stringify({ arguments: args }).slice(0, -1)],
+];
+
+for (const [shape, wrap] of TEXT_CALL_SHAPES) {
+  test(`a forced call answered as text (${shape}) is used, not generated a second time`, async () => {
+    const llm = new TextCallExecutor(wrap);
+    const { dir } = await runEdit(llm as unknown as ScriptedExecutor);
+
+    assert.equal(await readFile(join(dir, 'src', 'math.ts'), 'utf8'), SOURCE.replace('a - b', 'a + b'));
+    const askedAgain = llm.requests.some((request) =>
+      request.messages.some((message) => /Reply with a single JSON object/.test(message.content ?? '')),
+    );
+    assert.ok(!askedAgain, 'the same answer was paid for twice');
+  });
+}
+
+test('arguments are found whatever the executor wrapped them in', () => {
+  const args = { path: 'index.html', content: '<html>{ not json }</html>' };
+  const shapes = [
+    JSON.stringify(args),
+    JSON.stringify({ arguments: args }),
+    JSON.stringify({ tool_call: { type: 'write_file', arguments: args } }),
+    JSON.stringify({ tool: 'write_file', ...args, criteria_met: ['1: <html>'] }),
+    JSON.stringify({ function: { name: 'write_file', arguments: JSON.stringify(args) } }),
+  ];
+  for (const shape of shapes) {
+    const parsed = unwrapToolArguments(extractJsonObject(shape));
+    assert.equal(parsed?.['path'], 'index.html', shape.slice(0, 50));
+    assert.equal(parsed?.['content'], args.content, shape.slice(0, 50));
+  }
+});
+
+test('a forgotten closing brace is repaired only when asked, and never over a cut-off string', () => {
+  const whole = JSON.stringify({ arguments: { path: 'index.html', content: '<html></html>' } });
+  const short = whole.slice(0, -1);
+  assert.equal(extractJsonObject(short), undefined, 'a repair nobody asked for');
+  assert.equal(unwrapToolArguments(extractJsonObject(short, true))?.['path'], 'index.html');
+
+  // Cut off inside the content: no punctuation makes this whole, and closing it would write half a file.
+  const cut = '{"arguments": {"path": "a.html", "content": "<style>a{color:red}</style><p>half';
+  assert.equal(extractJsonObject(cut, true), undefined);
 });

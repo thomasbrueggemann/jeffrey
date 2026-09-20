@@ -1289,13 +1289,13 @@ export class Agent {
         .filter((args): args is Record<string, unknown> => Boolean(args));
       if (parsed) return { parsed, truncated, more };
     }
-    if (mode === 'prompt') {
-      const parsed = extractJsonObject(result.content);
-      if (parsed) {
-        const args = parsed['arguments'] ?? parsed;
-        if (typeof args === 'object' && args !== null) return { parsed: args as Record<string, unknown>, truncated, more: [] };
-      }
-    }
+    // A tool call that arrived as text. `tool_choice` is a request, not a guarantee: asked to force
+    // write_file, a server may answer with the call as JSON in the content and `tool_calls` empty.
+    // The arguments are there and complete, and asking again means generating the whole file a second
+    // time — two minutes and ten thousand tokens for an answer already in hand. A cut-off reply is
+    // never repaired, whichever mode it came from: its last string is half a file.
+    const fromContent = unwrapToolArguments(extractJsonObject(result.content, !truncated));
+    if (fromContent) return { parsed: fromContent, truncated, more: [] };
     return { parsed: undefined, truncated, more: [] };
   }
 
@@ -1683,18 +1683,84 @@ function safeJson(text: string): Record<string, unknown> | undefined {
 }
 
 /** Tolerant object extraction: local models love to wrap JSON in prose or fences. */
-export function extractJsonObject(text: string): Record<string, unknown> | undefined {
+export function extractJsonObject(text: string, repair = false): Record<string, unknown> | undefined {
   const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
   const candidate = fenced?.[1] ?? text;
   const start = candidate.indexOf('{');
   const end = candidate.lastIndexOf('}');
   if (start === -1 || end <= start) return undefined;
+  const body = candidate.slice(start, end + 1);
+  return parseObject(body) ?? (repair ? parseObject(closeBrackets(body)) : undefined);
+}
+
+function parseObject(text: string | undefined): Record<string, unknown> | undefined {
+  if (text === undefined) return undefined;
   try {
-    const parsed = JSON.parse(candidate.slice(start, end + 1));
+    const parsed = JSON.parse(text);
     return typeof parsed === 'object' && parsed !== null ? (parsed as Record<string, unknown>) : undefined;
   } catch {
     return undefined;
   }
+}
+
+/**
+ * The same text with the brackets it left open closed, or undefined if it ended inside a string.
+ *
+ * Asked for `{"arguments": { ... }}`, the executor answers `{"arguments": { ... }` often enough to
+ * matter: it closes the arguments and forgets the wrapper. The whole file it just wrote sits inside,
+ * so one brace is the difference between the step landing and another two-minute generation of the
+ * same content. Only brackets are added, never text. A reply that ends mid-string is missing content
+ * rather than punctuation, and a cut-off reply must not be offered here at all: its last string is
+ * half a file, and closing it would write that half over the real one.
+ */
+function closeBrackets(text: string): string | undefined {
+  const stack: string[] = [];
+  let inString = false;
+  let escaped = false;
+  for (const char of text) {
+    if (escaped) {
+      escaped = false;
+    } else if (inString) {
+      if (char === '\\') escaped = true;
+      else if (char === '"') inString = false;
+    } else if (char === '"') {
+      inString = true;
+    } else if (char === '{' || char === '[') {
+      stack.push(char === '{' ? '}' : ']');
+    } else if (char === '}' || char === ']') {
+      stack.pop();
+    }
+  }
+  return inString || !stack.length ? undefined : text + stack.reverse().join('');
+}
+
+/** Keys a reply may nest the real arguments under. None is a declared argument of any tool. */
+const ARGUMENT_WRAPPERS = ['arguments', 'parameters', 'tool_call', 'function', 'input'];
+
+/**
+ * The arguments inside whatever the executor wrapped them in.
+ *
+ * Four shapes came back from one run of a single model: the arguments bare, under `arguments`, under
+ * `tool_call.arguments`, and as a JSON string. Unwrapping costs nothing and each shape it recognises
+ * is a generation of the whole file not paid for twice. Keys the tool does not declare are dropped
+ * downstream by `schemaKeys`, so a flat reply carrying `tool` or `criteria_met` alongside the real
+ * arguments is safe to return as is.
+ */
+export function unwrapToolArguments(value: unknown, depth = 0): Record<string, unknown> | undefined {
+  if (depth > 3) return undefined;
+  // OpenAI serialises arguments as a JSON string; a server answering in the content copies the habit.
+  if (typeof value === 'string') {
+    const inner = extractJsonObject(value);
+    return inner ? unwrapToolArguments(inner, depth + 1) : undefined;
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  for (const key of ARGUMENT_WRAPPERS) {
+    if (!(key in record)) continue;
+    const inner = unwrapToolArguments(record[key], depth + 1);
+    if (inner) return inner;
+  }
+  return record;
 }
 
 function summariseArgs(args: Record<string, unknown>): string {
